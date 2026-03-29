@@ -3,10 +3,11 @@ import json
 import os
 import time
 import tkinter as tk
+from collections import deque
 from pathlib import Path
 
 import numpy as np
-from PIL import Image, ImageDraw
+from PIL import Image, ImageDraw, ImageTk
 from rlgym.rocket_league import common_values
 
 from dribble import (
@@ -25,15 +26,15 @@ from dribble import (
 ROOT_DIR = Path(__file__).resolve().parent
 METRICS_DIR = ROOT_DIR / "metrics"
 ARTIFACTS_DIR = ROOT_DIR / "artifacts"
-RECORD_GIFS_DIR = ARTIFACTS_DIR / "record_breakers"
+P95_GIFS_DIR = ARTIFACTS_DIR / "periodic_p95"
 METRICS_CSV = METRICS_DIR / "dribble_episode_metrics.csv"
 PHASE4_METRICS_CSV = METRICS_DIR / "dribble_phase4_metrics.csv"
 METRICS_MARKERS_JSON = METRICS_DIR / "dribble_markers.json"
 
-MAX_PLOT_WIDTH = 1520
-MAX_PLOT_HEIGHT = 1280
-MIN_PLOT_WIDTH = 1080
-MIN_PLOT_HEIGHT = 860
+MAX_PLOT_WIDTH = 1200
+MAX_PLOT_HEIGHT = 920
+MIN_PLOT_WIDTH = 1000
+MIN_PLOT_HEIGHT = 800
 PLOT_PADDING = 50
 ROLLING_WINDOW = 50
 MAX_RENDER_POINTS = 420
@@ -42,11 +43,12 @@ TITLE_FONT = ("Helvetica", 11, "bold")
 AXIS_FONT = ("Helvetica", 9)
 MARKER_FONT = ("Helvetica", 9, "bold")
 LEGEND_FONT = ("Helvetica", 9, "bold")
-RECORD_GIF_WIDTH = 1200
-RECORD_GIF_HEIGHT = 800
-RECORD_GIF_PADDING = 40
-RECORD_GIF_FRAME_STRIDE = 2
-RECORD_GIF_FRAME_DURATION_MS = 1000 // 12
+EPISODE_GIF_WIDTH = 1200
+EPISODE_GIF_HEIGHT = 800
+EPISODE_GIF_PADDING = 40
+EPISODE_GIF_FRAME_STRIDE = 2
+EPISODE_GIF_FRAME_DURATION_MS = 1000 // 12
+P95_GIF_INTERVAL = 10_000
 
 
 def _rolling_average(values, window):
@@ -221,16 +223,16 @@ def _project_markers_to_tracked(markers, tracked_global_episodes):
     return projected
 
 
-def _record_scale():
+def _field_scale(canvas_width, canvas_height, padding):
     return min(
-        (RECORD_GIF_WIDTH - 2 * RECORD_GIF_PADDING) / (2 * common_values.SIDE_WALL_X),
-        (RECORD_GIF_HEIGHT - 2 * RECORD_GIF_PADDING) / (2 * common_values.BACK_WALL_Y),
+        (canvas_width - 2 * padding) / (2 * common_values.SIDE_WALL_X),
+        (canvas_height - 2 * padding) / (2 * common_values.BACK_WALL_Y),
     )
 
 
-def _record_to_canvas(position_xy):
-    x = RECORD_GIF_WIDTH / 2 + float(position_xy[0]) * _record_scale()
-    y = RECORD_GIF_HEIGHT / 2 - float(position_xy[1]) * _record_scale()
+def _field_to_canvas(position_xy, canvas_width, canvas_height, scale):
+    x = canvas_width / 2 + float(position_xy[0]) * scale
+    y = canvas_height / 2 - float(position_xy[1]) * scale
     return x, y
 
 
@@ -248,23 +250,27 @@ def _rotated_triangle(center_x, center_y, angle, length=34, width=22):
     return out
 
 
-def _draw_record_frame(frame, title):
-    image = Image.new("RGB", (RECORD_GIF_WIDTH, RECORD_GIF_HEIGHT), "#135d36")
+def _draw_episode_frame(frame, title, canvas_width=EPISODE_GIF_WIDTH, canvas_height=EPISODE_GIF_HEIGHT, padding=EPISODE_GIF_PADDING, trail=None):
+    image = Image.new("RGB", (canvas_width, canvas_height), "#135d36")
     draw = ImageDraw.Draw(image)
+    scale = _field_scale(canvas_width, canvas_height, padding)
 
-    left, top = _record_to_canvas((-common_values.SIDE_WALL_X, common_values.BACK_WALL_Y))
-    right, bottom = _record_to_canvas((common_values.SIDE_WALL_X, -common_values.BACK_WALL_Y))
+    def to_canvas(pos):
+        return _field_to_canvas(pos, canvas_width, canvas_height, scale)
+
+    left, top = to_canvas((-common_values.SIDE_WALL_X, common_values.BACK_WALL_Y))
+    right, bottom = to_canvas((common_values.SIDE_WALL_X, -common_values.BACK_WALL_Y))
     draw.rectangle((left, top, right, bottom), outline="#ecf7ec", width=4)
 
-    center_x = RECORD_GIF_WIDTH / 2
-    draw.line((center_x, top, center_x, bottom), fill="#ecf7ec", width=2)
-    circle_radius = 600 * _record_scale()
+    cx = canvas_width / 2
+    draw.line((cx, top, cx, bottom), fill="#ecf7ec", width=2)
+    circle_radius = 600 * scale
     draw.ellipse(
         (
-            center_x - circle_radius,
-            RECORD_GIF_HEIGHT / 2 - circle_radius,
-            center_x + circle_radius,
-            RECORD_GIF_HEIGHT / 2 + circle_radius,
+            cx - circle_radius,
+            canvas_height / 2 - circle_radius,
+            cx + circle_radius,
+            canvas_height / 2 + circle_radius,
         ),
         outline="#ecf7ec",
         width=2,
@@ -273,23 +279,27 @@ def _draw_record_frame(frame, title):
     loop_x = float(frame.get("loop_x", 0.0))
     loop_y = float(frame.get("loop_y", 0.0))
     if loop_x > 0.0 and loop_y > 0.0:
-        lane_left, lane_top = _record_to_canvas((-loop_x, loop_y))
-        lane_right, lane_bottom = _record_to_canvas((loop_x, -loop_y))
+        lane_left, lane_top = to_canvas((-loop_x, loop_y))
+        lane_right, lane_bottom = to_canvas((loop_x, -loop_y))
         draw.ellipse((lane_left, lane_top, lane_right, lane_bottom), outline="#f59e0b", width=3)
+
+    if trail and len(trail) >= 2:
+        trail_points = [to_canvas((f["car_x"], f["car_y"])) for f in trail]
+        draw.line(trail_points, fill="#93c5fd", width=2)
 
     target_x = float(frame.get("target_x", 0.0))
     target_y = float(frame.get("target_y", 0.0))
     if frame.get("has_target", False):
-        wp_x, wp_y = _record_to_canvas((target_x, target_y))
+        wp_x, wp_y = to_canvas((target_x, target_y))
         draw.ellipse((wp_x - 16, wp_y - 16, wp_x + 16, wp_y + 16), outline="#ff4fd8", width=4)
         draw.line((wp_x - 20, wp_y, wp_x + 20, wp_y), fill="#ff4fd8", width=3)
         draw.line((wp_x, wp_y - 20, wp_x, wp_y + 20), fill="#ff4fd8", width=3)
         draw.text((wp_x + 14, wp_y - 28), "WP", fill="#ff4fd8")
 
-    ball_x, ball_y = _record_to_canvas((frame["ball_x"], frame["ball_y"]))
+    ball_x, ball_y = to_canvas((frame["ball_x"], frame["ball_y"]))
     draw.ellipse((ball_x - 10, ball_y - 10, ball_x + 10, ball_y + 10), fill="#f8fafc")
 
-    car_x, car_y = _record_to_canvas((frame["car_x"], frame["car_y"]))
+    car_x, car_y = to_canvas((frame["car_x"], frame["car_y"]))
     draw.polygon(_rotated_triangle(car_x, car_y, frame["heading"]), fill="#55a4ff", outline="#0f172a")
     draw.text((car_x + 10, car_y - 10), "B1", fill="#f8fafc")
 
@@ -306,7 +316,7 @@ class DribbleDashboard:
         screen_width = max(int(self.root.winfo_screenwidth()), MIN_PLOT_WIDTH)
         screen_height = max(int(self.root.winfo_screenheight()), MIN_PLOT_HEIGHT)
         self.plot_width = max(MIN_PLOT_WIDTH, min(MAX_PLOT_WIDTH, screen_width - 120))
-        self.plot_height = max(760, min(MAX_PLOT_HEIGHT, screen_height - 140))
+        self.plot_height = max(MIN_PLOT_HEIGHT, min(MAX_PLOT_HEIGHT, screen_height - 140))
         self.root.geometry(f"{self.plot_width}x{self.plot_height}+40+40")
         self.canvas = tk.Canvas(
             self.root,
@@ -316,7 +326,8 @@ class DribbleDashboard:
             highlightthickness=0,
         )
         self.canvas.pack()
-        self.update({}, 0, 0)
+        self._minimap_photo = None
+        self.update({}, 0, 0, 0)
 
     def close(self):
         if self.closed:
@@ -324,81 +335,81 @@ class DribbleDashboard:
         self.closed = True
         self.root.destroy()
 
-    def update(self, plot_data, episode_count, update_seconds):
+    def update(self, plot_data, episode_count, update_seconds, cumulative_timesteps, minimap_frames=None):
         if self.closed:
             return
 
         self.canvas.delete("all")
+
+        ts_display = f"{cumulative_timesteps / 1000:.0f}k" if cumulative_timesteps >= 1000 else str(cumulative_timesteps)
         self.canvas.create_text(
             PLOT_PADDING,
             22,
             anchor="w",
             text=(
                 f"Episodes: {episode_count}    "
-                f"Display: up to {MAX_RENDER_POINTS} bins    "
-                f"Dashboard refresh: every {update_seconds:.1f}s    "
+                f"Timesteps: {ts_display}    "
+                f"Refresh: every {update_seconds:.1f}s    "
                 f"Updated: {time.strftime('%H:%M:%S')}"
             ),
             fill="#111827",
             font=HEADER_FONT,
         )
 
+        minimap_width = int(self.plot_width * 0.32)
+        charts_width = self.plot_width - minimap_width - PLOT_PADDING
         top_y = 60
-        top_height = min(310, max(235, int(self.plot_height * 0.245)))
-        top_width = (self.plot_width - PLOT_PADDING * 3) / 2
-        self._draw_plot(
-            x0=PLOT_PADDING,
-            y0=top_y,
-            width=top_width,
-            height=top_height,
-            spec=plot_data.get("carry_time", {}),
-            title="Carry Time Per Episode (s)",
-            point_color="#2563eb",
-            x_label_prefix="Episode",
-        )
-        self._draw_plot(
-            x0=PLOT_PADDING * 2 + top_width,
-            y0=top_y,
-            width=top_width,
-            height=top_height,
-            spec=plot_data.get("distance", {}),
-            title="Distance Traveled Per Episode (uu)",
-            point_color="#ea580c",
-            x_label_prefix="Episode",
-        )
+        chart_gap_x = PLOT_PADDING
+        chart_gap_y = 60
+        chart_w = (charts_width - chart_gap_x) / 2
+        available_height = self.plot_height - top_y - PLOT_PADDING
+        chart_h = max(180, (available_height - chart_gap_y) / 2)
 
-        row_gap = 50
-        section_gap = 68
-        row1_y = top_y + top_height + section_gap
-        bottom_width = (self.plot_width - PLOT_PADDING * 4) / 3
-        bottom_total_height = self.plot_height - row1_y - PLOT_PADDING
-        bottom_height = max(150, int((bottom_total_height - row_gap) / 2))
-        row2_y = row1_y + bottom_height + row_gap
-        specs = [
-            ("carry_distance", "Carry Distance While Carrying (uu)", "#0891b2", PLOT_PADDING, row1_y),
-            ("loop_progress", "Loop Progress Per Episode (uu)", "#7c3aed", PLOT_PADDING * 2 + bottom_width, row1_y),
-            ("correct_turn_yaw", "Correct-Turn Yaw Per Episode (rad)", "#0f766e", PLOT_PADDING * 3 + bottom_width * 2, row1_y),
-            ("breadcrumbs_reached", "Breadcrumbs Reached Per Episode", "#b45309", PLOT_PADDING, row2_y),
-            ("wall_approach_penalty", "Wall Approach Penalty Per Episode", "#dc2626", PLOT_PADDING * 2 + bottom_width, row2_y),
-            ("near_wall_carry_seconds", "Near-Wall Carry Time Per Episode (s)", "#4f46e5", PLOT_PADDING * 3 + bottom_width * 2, row2_y),
+        chart_specs = [
+            ("carry_time", "Carry Time Per Episode (s)", "#2563eb", "Episode",
+             PLOT_PADDING, top_y),
+            ("carry_distance", "Carry Distance (uu)", "#0891b2", "Tracked Episode",
+             PLOT_PADDING + chart_w + chart_gap_x, top_y),
+            ("loop_progress", "Loop Progress Per Episode (uu)", "#7c3aed", "Tracked Episode",
+             PLOT_PADDING, top_y + chart_h + chart_gap_y),
+            ("breadcrumbs_reached", "Breadcrumbs Reached Per Episode", "#b45309", "Tracked Episode",
+             PLOT_PADDING + chart_w + chart_gap_x, top_y + chart_h + chart_gap_y),
         ]
-        for key, title, color, x0, y0 in specs:
+        for key, title, color, x_prefix, x0, y0 in chart_specs:
             self._draw_plot(
-                x0=x0,
-                y0=y0,
-                width=bottom_width,
-                height=bottom_height,
+                x0=x0, y0=y0, width=chart_w, height=chart_h,
                 spec=plot_data.get(key, {}),
-                title=title,
-                point_color=color,
-                x_label_prefix="Tracked Episode",
+                title=title, point_color=color, x_label_prefix=x_prefix,
             )
+
+        minimap_x = self.plot_width - minimap_width
+        minimap_y = top_y
+        minimap_h = available_height
+        self._render_minimap(minimap_frames, minimap_x, minimap_y, minimap_width, minimap_h)
 
         try:
             self.root.update_idletasks()
             self.root.update()
         except tk.TclError:
             self.closed = True
+
+    def _render_minimap(self, frames, x0, y0, width, height):
+        if not frames:
+            self.canvas.create_rectangle(x0, y0, x0 + width, y0 + height, outline="#9ca3af", width=2)
+            self.canvas.create_text(
+                x0 + width / 2, y0 + height / 2,
+                text="Waiting for\nepisode data...",
+                fill="#6b7280", font=("Helvetica", 11), justify="center",
+            )
+            return
+
+        last_frame = frames[-1]
+        padding = 20
+        image = _draw_episode_frame(
+            last_frame, "", canvas_width=width, canvas_height=height, padding=padding, trail=frames,
+        )
+        self._minimap_photo = ImageTk.PhotoImage(image)
+        self.canvas.create_image(x0, y0, anchor="nw", image=self._minimap_photo)
 
     def _draw_plot(self, x0, y0, width, height, spec, title, point_color, x_label_prefix):
         x1 = x0 + width
@@ -571,15 +582,12 @@ class DribbleMetricsLogger:
 
         METRICS_DIR.mkdir(exist_ok=True)
         ARTIFACTS_DIR.mkdir(exist_ok=True)
-        RECORD_GIFS_DIR.mkdir(exist_ok=True)
+        P95_GIFS_DIR.mkdir(exist_ok=True)
 
         self.carry_seconds, self.distances = _load_metric_history()
         self.carry_rolling = _rolling_average(self.carry_seconds, ROLLING_WINDOW)
         self.carry_p05 = _rolling_percentile(self.carry_seconds, ROLLING_WINDOW, 5)
         self.carry_p95 = _rolling_percentile(self.carry_seconds, ROLLING_WINDOW, 95)
-        self.distance_rolling = _rolling_average(self.distances, ROLLING_WINDOW)
-        self.distance_p05 = _rolling_percentile(self.distances, ROLLING_WINDOW, 5)
-        self.distance_p95 = _rolling_percentile(self.distances, ROLLING_WINDOW, 95)
 
         phase4 = _load_phase4_history()
         self.phase4_episodes = phase4["episodes"]
@@ -596,22 +604,17 @@ class DribbleMetricsLogger:
         self.loop_progress_rolling = _rolling_average(self.loop_progress, ROLLING_WINDOW)
         self.loop_progress_p05 = _rolling_percentile(self.loop_progress, ROLLING_WINDOW, 5)
         self.loop_progress_p95 = _rolling_percentile(self.loop_progress, ROLLING_WINDOW, 95)
-        self.correct_turn_yaw_rolling = _rolling_average(self.correct_turn_yaw, ROLLING_WINDOW)
-        self.correct_turn_yaw_p05 = _rolling_percentile(self.correct_turn_yaw, ROLLING_WINDOW, 5)
-        self.correct_turn_yaw_p95 = _rolling_percentile(self.correct_turn_yaw, ROLLING_WINDOW, 95)
         self.breadcrumbs_reached_rolling = _rolling_average(self.breadcrumbs_reached, ROLLING_WINDOW)
         self.breadcrumbs_reached_p05 = _rolling_percentile(self.breadcrumbs_reached, ROLLING_WINDOW, 5)
         self.breadcrumbs_reached_p95 = _rolling_percentile(self.breadcrumbs_reached, ROLLING_WINDOW, 95)
-        self.wall_approach_penalty_rolling = _rolling_average(self.wall_approach_penalty, ROLLING_WINDOW)
-        self.wall_approach_penalty_p05 = _rolling_percentile(self.wall_approach_penalty, ROLLING_WINDOW, 5)
-        self.wall_approach_penalty_p95 = _rolling_percentile(self.wall_approach_penalty, ROLLING_WINDOW, 95)
-        self.near_wall_carry_seconds_rolling = _rolling_average(self.near_wall_carry_seconds, ROLLING_WINDOW)
-        self.near_wall_carry_seconds_p05 = _rolling_percentile(self.near_wall_carry_seconds, ROLLING_WINDOW, 5)
-        self.near_wall_carry_seconds_p95 = _rolling_percentile(self.near_wall_carry_seconds, ROLLING_WINDOW, 95)
 
         self.markers = _load_markers()
         self.episode_counter = len(self.carry_seconds)
-        self.best_carry_record = max(self.carry_seconds) if self.carry_seconds else 0.0
+
+        self.episode_frame_buffer = deque(maxlen=ROLLING_WINDOW)
+        self.last_episode_frames = []
+        self.last_gif_timestep = 0
+        self.cumulative_timesteps = 0
 
         if not METRICS_CSV.exists():
             with METRICS_CSV.open("w", newline="") as handle:
@@ -634,7 +637,7 @@ class DribbleMetricsLogger:
                 )
 
         self.dashboard = DribbleDashboard()
-        self.dashboard.update(self._build_plot_data(), self.episode_counter, self.dashboard_update_seconds)
+        self.dashboard.update(self._build_plot_data(), self.episode_counter, self.dashboard_update_seconds, 0)
 
     def __getstate__(self):
         state = self.__dict__.copy()
@@ -647,9 +650,6 @@ class DribbleMetricsLogger:
             "carry_rolling",
             "carry_p05",
             "carry_p95",
-            "distance_rolling",
-            "distance_p05",
-            "distance_p95",
             "phase4_episodes",
             "carry_distance",
             "loop_progress",
@@ -663,23 +663,17 @@ class DribbleMetricsLogger:
             "loop_progress_rolling",
             "loop_progress_p05",
             "loop_progress_p95",
-            "correct_turn_yaw_rolling",
-            "correct_turn_yaw_p05",
-            "correct_turn_yaw_p95",
             "breadcrumbs_reached_rolling",
             "breadcrumbs_reached_p05",
             "breadcrumbs_reached_p95",
-            "wall_approach_penalty_rolling",
-            "wall_approach_penalty_p05",
-            "wall_approach_penalty_p95",
-            "near_wall_carry_seconds_rolling",
-            "near_wall_carry_seconds_p05",
-            "near_wall_carry_seconds_p95",
             "markers",
         ):
             state[key] = []
         state["episode_counter"] = 0
-        state["best_carry_record"] = 0.0
+        state["episode_frame_buffer"] = deque(maxlen=ROLLING_WINDOW)
+        state["last_episode_frames"] = []
+        state["last_gif_timestep"] = 0
+        state["cumulative_timesteps"] = 0
         return state
 
     def __setstate__(self, state):
@@ -767,6 +761,8 @@ class DribbleMetricsLogger:
         return [metric]
 
     def report_metrics(self, collected_metrics, wandb_run, cumulative_timesteps):
+        self.cumulative_timesteps = cumulative_timesteps
+
         for serialized_metrics in collected_metrics:
             metrics_arrays = self._deserialize(serialized_metrics)
             if not metrics_arrays:
@@ -797,9 +793,17 @@ class DribbleMetricsLogger:
                 )
             wandb_run.log(log_data)
 
+        if cumulative_timesteps - self.last_gif_timestep >= P95_GIF_INTERVAL:
+            self._save_p95_gif()
+            self.last_gif_timestep = cumulative_timesteps
+
         now = time.monotonic()
         if now - self.last_dashboard_time >= self.dashboard_update_seconds:
-            self.dashboard.update(self._build_plot_data(), self.episode_counter, self.dashboard_update_seconds)
+            self.dashboard.update(
+                self._build_plot_data(), self.episode_counter,
+                self.dashboard_update_seconds, cumulative_timesteps,
+                minimap_frames=self.last_episode_frames,
+            )
             self.last_dashboard_time = now
 
     def _build_plot_data(self):
@@ -810,13 +814,6 @@ class DribbleMetricsLogger:
                 "mean": self.carry_rolling,
                 "p05": self.carry_p05,
                 "p95": self.carry_p95,
-                "markers": self.markers,
-                "x_end_label": self.episode_counter,
-            },
-            "distance": {
-                "mean": self.distance_rolling,
-                "p05": self.distance_p05,
-                "p95": self.distance_p95,
                 "markers": self.markers,
                 "x_end_label": self.episode_counter,
             },
@@ -834,31 +831,10 @@ class DribbleMetricsLogger:
                 "markers": tracked_markers,
                 "x_end_label": tracked_count,
             },
-            "correct_turn_yaw": {
-                "mean": self.correct_turn_yaw_rolling,
-                "p05": self.correct_turn_yaw_p05,
-                "p95": self.correct_turn_yaw_p95,
-                "markers": tracked_markers,
-                "x_end_label": tracked_count,
-            },
             "breadcrumbs_reached": {
                 "mean": self.breadcrumbs_reached_rolling,
                 "p05": self.breadcrumbs_reached_p05,
                 "p95": self.breadcrumbs_reached_p95,
-                "markers": tracked_markers,
-                "x_end_label": tracked_count,
-            },
-            "wall_approach_penalty": {
-                "mean": self.wall_approach_penalty_rolling,
-                "p05": self.wall_approach_penalty_p05,
-                "p95": self.wall_approach_penalty_p95,
-                "markers": tracked_markers,
-                "x_end_label": tracked_count,
-            },
-            "near_wall_carry_seconds": {
-                "mean": self.near_wall_carry_seconds_rolling,
-                "p05": self.near_wall_carry_seconds_p05,
-                "p95": self.near_wall_carry_seconds_p95,
                 "markers": tracked_markers,
                 "x_end_label": tracked_count,
             },
@@ -984,7 +960,7 @@ class DribbleMetricsLogger:
         self.episode_counter += 1
 
         _append_rolling_stats(self.carry_seconds, self.carry_rolling, self.carry_p05, self.carry_p95, carry_seconds)
-        _append_rolling_stats(self.distances, self.distance_rolling, self.distance_p05, self.distance_p95, distance)
+        self.distances.append(distance)
 
         self.phase4_episodes.append(self.episode_counter)
         _append_rolling_stats(
@@ -1001,13 +977,7 @@ class DribbleMetricsLogger:
             self.loop_progress_p95,
             loop_progress,
         )
-        _append_rolling_stats(
-            self.correct_turn_yaw,
-            self.correct_turn_yaw_rolling,
-            self.correct_turn_yaw_p05,
-            self.correct_turn_yaw_p95,
-            correct_turn_yaw,
-        )
+        self.correct_turn_yaw.append(correct_turn_yaw)
         _append_rolling_stats(
             self.breadcrumbs_reached,
             self.breadcrumbs_reached_rolling,
@@ -1015,20 +985,8 @@ class DribbleMetricsLogger:
             self.breadcrumbs_reached_p95,
             breadcrumbs_reached,
         )
-        _append_rolling_stats(
-            self.wall_approach_penalty,
-            self.wall_approach_penalty_rolling,
-            self.wall_approach_penalty_p05,
-            self.wall_approach_penalty_p95,
-            wall_approach_penalty,
-        )
-        _append_rolling_stats(
-            self.near_wall_carry_seconds,
-            self.near_wall_carry_seconds_rolling,
-            self.near_wall_carry_seconds_p05,
-            self.near_wall_carry_seconds_p95,
-            near_wall_carry_seconds,
-        )
+        self.wall_approach_penalty.append(wall_approach_penalty)
+        self.near_wall_carry_seconds.append(near_wall_carry_seconds)
 
         with METRICS_CSV.open("a", newline="") as handle:
             writer = csv.writer(handle)
@@ -1048,14 +1006,9 @@ class DribbleMetricsLogger:
                 ]
             )
 
-        if carry_seconds > self.best_carry_record + 1e-6:
-            self.best_carry_record = carry_seconds
-            self._save_record_breaker_gif(
-                episode=self.episode_counter,
-                carry_seconds=carry_seconds,
-                breadcrumbs_reached=breadcrumbs_reached,
-                frames=state.get("frames", []),
-            )
+        episode_frames = list(state.get("frames", []))
+        self.episode_frame_buffer.append((carry_seconds, episode_frames))
+        self.last_episode_frames = episode_frames
 
     @staticmethod
     def _deserialize(serialized_metrics):
@@ -1090,35 +1043,45 @@ class DribbleMetricsLogger:
             "loop_y": float(loop_y),
         }
 
-    def _save_record_breaker_gif(self, episode, carry_seconds, breadcrumbs_reached, frames):
-        if not frames:
+    def _save_p95_gif(self):
+        if not self.episode_frame_buffer:
             return
 
-        sampled_frames = frames[::RECORD_GIF_FRAME_STRIDE]
-        if sampled_frames[-1] is not frames[-1]:
-            sampled_frames.append(frames[-1])
+        carry_values = [cs for cs, _ in self.episode_frame_buffer]
+        p95_value = float(np.percentile(carry_values, 95))
+        best_carry, best_frames = min(
+            self.episode_frame_buffer, key=lambda pair: abs(pair[0] - p95_value),
+        )
+
+        if not best_frames:
+            return
+
+        sampled_frames = best_frames[::EPISODE_GIF_FRAME_STRIDE]
+        if sampled_frames[-1] is not best_frames[-1]:
+            sampled_frames.append(best_frames[-1])
 
         images = []
         for index, frame in enumerate(sampled_frames):
             images.append(
-                _draw_record_frame(
+                _draw_episode_frame(
                     frame,
                     (
-                        f"Record attempt | episode {episode} | "
-                        f"carry {carry_seconds:.2f}s | breadcrumbs {int(breadcrumbs_reached)} | "
+                        f"P95 snapshot | ts {self.cumulative_timesteps} | ep {self.episode_counter} | "
+                        f"carry {best_carry:.2f}s | "
                         f"frame {index + 1}/{len(sampled_frames)}"
                     ),
+                    trail=best_frames,
                 )
             )
 
-        filename = f"record_ep{episode:07d}_{carry_seconds:.2f}s.gif"
-        output_path = RECORD_GIFS_DIR / filename
+        filename = f"p95_ts{self.cumulative_timesteps:09d}_{best_carry:.2f}s.gif"
+        output_path = P95_GIFS_DIR / filename
         images[0].save(
             output_path,
             save_all=True,
             append_images=images[1:],
-            duration=RECORD_GIF_FRAME_DURATION_MS,
+            duration=EPISODE_GIF_FRAME_DURATION_MS,
             loop=0,
             optimize=False,
         )
-        print(f"Saved record breaker GIF: {output_path}")
+        print(f"Saved P95 GIF: {output_path}")

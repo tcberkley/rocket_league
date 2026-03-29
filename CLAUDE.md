@@ -80,11 +80,11 @@ artifacts/        Generated GIFs (rollouts and record-breakers)
 - `--dashboard` enables the local Tk dashboard during dribble training
 - `--dashboard-update-seconds` controls refresh cadence; the current default is `1.0`
 - The dashboard loads history from `metrics/dribble_episode_metrics.csv`; phase 4 loop metrics go to `metrics/dribble_phase4_metrics.csv`
+- Dashboard layout: 2x2 chart grid (carry time, carry distance, loop progress, breadcrumbs reached) + live field minimap on the right showing car trail, loop lane, waypoint, and ball from the last completed episode
 - Charts display 50-episode rolling averages with 5th/95th percentile bands, compressed into at most 420 plotted bins
-- Dashboard includes a live field minimap showing car position, ball, loop lane ellipse, and current waypoint
-- Record-breaking episodes automatically generate animated GIF replays saved to `artifacts/record_breakers/`
+- Every 10k timesteps, a P95 GIF snapshot is saved to `artifacts/periodic_p95/` — picks the episode closest to the 95th percentile carry time from the last 50 episodes
 - Annotation markers (stored in `metrics/dribble_markers.json`) can be placed on charts to mark training milestones
-- The plotted `distance_traveled_uu` metric is episode path length in the ground plane (`x/y` step-to-step distance), not straight-line displacement from spawn
+- Additional metrics (distance traveled, correct-turn yaw, wall approach penalty, near-wall carry time) are still logged to CSV but not shown on the dashboard
 
 ## macOS M-Series Notes
 

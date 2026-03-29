@@ -70,17 +70,16 @@ Useful options:
 
 ## Dashboard
 
-When training dribble mode with `--dashboard`, a local Tk window opens with live plots:
+When training dribble mode with `--dashboard`, a local Tk window opens with:
 
-- carry time per episode
-- distance traveled per episode
-- a live field minimap showing car position, loop lane, and current waypoint
+- 4 charts: carry time, carry distance, loop progress, breadcrumbs reached
+- a live field minimap showing the car trail, loop lane, waypoint, and ball from the last completed episode
 
 The plots show 50-episode rolling averages with 5th/95th percentile bands.
 
-Record-breaking episodes automatically generate animated GIF replays in `artifacts/record_breakers/`.
+Every 10,000 timesteps, a GIF of a 95th percentile episode is saved to `artifacts/periodic_p95/`.
 
-The dashboard reads from `metrics/dribble_episode_metrics.csv` (and `metrics/dribble_phase4_metrics.csv` for loop-specific stats).
+The dashboard reads from `metrics/dribble_episode_metrics.csv` (and `metrics/dribble_phase4_metrics.csv` for loop-specific stats). Additional metrics like wall approach penalty and correct-turn yaw are still logged to CSV but not displayed on the dashboard.
 
 `distance traveled` is the total ground-path distance of the car during an episode, measured by summing step-to-step `x/y` movement.
 
