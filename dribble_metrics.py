@@ -47,7 +47,7 @@ EPISODE_GIF_HEIGHT = 800
 EPISODE_GIF_PADDING = 40
 EPISODE_GIF_FRAME_STRIDE = 2
 EPISODE_GIF_FRAME_DURATION_MS = 1000 // 12
-P95_GIF_INTERVAL = 10_000
+P95_GIF_EPISODE_INTERVAL = 10_000
 
 
 def _rolling_average(values, window):
@@ -611,7 +611,7 @@ class DribbleMetricsLogger:
 
         self.episode_frame_buffer = deque(maxlen=ROLLING_WINDOW)
         self.last_episode_frames = []
-        self.last_gif_timestep = 0
+        self.last_gif_episode = 0
         self.cumulative_timesteps = 0
 
         if not METRICS_CSV.exists():
@@ -668,7 +668,7 @@ class DribbleMetricsLogger:
         state["episode_counter"] = 0
         state["episode_frame_buffer"] = deque(maxlen=ROLLING_WINDOW)
         state["last_episode_frames"] = []
-        state["last_gif_timestep"] = 0
+        state["last_gif_episode"] = 0
         state["cumulative_timesteps"] = 0
         return state
 
@@ -791,9 +791,9 @@ class DribbleMetricsLogger:
                 )
             wandb_run.log(log_data)
 
-        if cumulative_timesteps - self.last_gif_timestep >= P95_GIF_INTERVAL:
+        if self.episode_counter - self.last_gif_episode >= P95_GIF_EPISODE_INTERVAL:
             self._save_p95_gif()
-            self.last_gif_timestep = cumulative_timesteps
+            self.last_gif_episode = self.episode_counter
 
         now = time.monotonic()
         if now - self.last_dashboard_time >= self.dashboard_update_seconds:
@@ -1023,7 +1023,7 @@ class DribbleMetricsLogger:
                 _draw_episode_frame(
                     frame,
                     (
-                        f"P95 snapshot | ts {self.cumulative_timesteps} | ep {self.episode_counter} | "
+                        f"P95 snapshot | ep {self.episode_counter} | "
                         f"carry {best_carry:.2f}s | "
                         f"frame {index + 1}/{len(sampled_frames)}"
                     ),
@@ -1031,7 +1031,7 @@ class DribbleMetricsLogger:
                 )
             )
 
-        filename = f"p95_ts{self.cumulative_timesteps:09d}_{best_carry:.2f}s.gif"
+        filename = f"p95_ep{self.episode_counter:07d}_{best_carry:.2f}s.gif"
         output_path = P95_GIFS_DIR / filename
         images[0].save(
             output_path,
