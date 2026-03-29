@@ -67,24 +67,25 @@ artifacts/        Generated GIFs (rollouts and record-breakers)
 ## Dribble Scenario
 
 - `main.py --scenario dribble` trains a single-car carry task instead of standard 1v1
-- `DribbleStartMutator` spawns the car on an elliptical loop lane with the ball on its hood, tangent-aligned to the lane direction
-- A **breadcrumb waypoint** system chains targets along the loop; reaching one spawns the next, rewarding continuous turning while carrying
-- **Curriculum difficulty** ramps from easy (wide loops, gentle turns) through medium to hard (tighter loops, more waypoints) based on episode count (`EASY_CURRICULUM_EPISODES`, `MIXED_CURRICULUM_EPISODES`)
-- Wall, corner, and wall-approach penalties discourage drifting to field edges during carries
-- Goal mouths are still treated as failure zones — driving into the goal ends the episode
-- The dribble reward combines carry quality, forward movement, loop progress (yaw delta + ellipse arc), tangent alignment, breadcrumb approach, and the anti-stall mechanism
-- Global state accessors `get_current_loop_state()` / `get_current_turn_target_xy()` expose loop info for visualization
+- `DribbleStartMutator` spawns the car at a random field position with the ball on its hood
+- **Termination**: ball touching ground (`ball_pos[2] < 100.0`), or car/ball entering a goal mouth
+- **Reward** (5 components): carry quality (always), breadcrumb approach (while carrying), breadcrumb success bonus (1.26–1.68 by difficulty), wall/corner/approach penalties, terminal penalty (-1.0 on drop)
+- A **breadcrumb waypoint** system chains targets; each success samples the next breadcrumb type from `("gentle", "sharp", "straight", "flip")` with curriculum-weighted probabilities
+- **Breadcrumb types** by arc geometry: gentle (wide curve), sharp (tight turn), straight (nearly ahead), flip (wide curve + negate turn direction)
+- **Direction flips**: when a `"flip"` breadcrumb is reached, `turn_direction` in `shared_info` is negated so the bot must learn CW↔CCW transitions mid-episode; gated by breadcrumbs_reached (easy: 5+, medium: 3+, hard: 2+)
+- **Curriculum difficulty** ramps from easy → medium → hard based on episode count; weights for sharp/flip breadcrumbs increase with difficulty
+- Global state accessor `get_current_loop_state()` exposes loop info for visualization
 
 ## Dashboard Metrics
 
 - `--dashboard` enables the local Tk dashboard during dribble training
 - `--dashboard-update-seconds` controls refresh cadence; the current default is `1.0`
-- The dashboard loads history from `metrics/dribble_episode_metrics.csv`; phase 4 loop metrics go to `metrics/dribble_phase4_metrics.csv`
-- Dashboard layout: 2x2 chart grid (carry time, carry distance, loop progress, breadcrumbs reached) + live field minimap on the right showing car trail, loop lane, waypoint, and ball from the last completed episode
+- The dashboard loads history from `metrics/dribble_episode_metrics.csv`; episode stats go to `metrics/dribble_phase4_metrics.csv`
+- Dashboard layout: 2x2 chart grid (carry time, breadcrumbs reached, avg reward, direction flips) + live field minimap on the right showing car trail, loop lane, waypoint, and ball from the last completed episode
 - Charts display 50-episode rolling averages with 5th/95th percentile bands, compressed into at most 420 plotted bins
 - Every 10k timesteps, a P95 GIF snapshot is saved to `artifacts/periodic_p95/` — picks the episode closest to the 95th percentile carry time from the last 50 episodes
 - Annotation markers (stored in `metrics/dribble_markers.json`) can be placed on charts to mark training milestones
-- Additional metrics (distance traveled, correct-turn yaw, wall approach penalty, near-wall carry time) are still logged to CSV but not shown on the dashboard
+- Wall approach penalty and near-wall carry seconds are still logged to CSV but not shown on the dashboard
 
 ## macOS M-Series Notes
 

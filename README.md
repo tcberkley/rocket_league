@@ -72,16 +72,14 @@ Useful options:
 
 When training dribble mode with `--dashboard`, a local Tk window opens with:
 
-- 4 charts: carry time, carry distance, loop progress, breadcrumbs reached
+- 4 charts: carry time, breadcrumbs reached, avg episode reward, direction flips
 - a live field minimap showing the car trail, loop lane, waypoint, and ball from the last completed episode
 
 The plots show 50-episode rolling averages with 5th/95th percentile bands.
 
 Every 10,000 timesteps, a GIF of a 95th percentile episode is saved to `artifacts/periodic_p95/`.
 
-The dashboard reads from `metrics/dribble_episode_metrics.csv` (and `metrics/dribble_phase4_metrics.csv` for loop-specific stats). Additional metrics like wall approach penalty and correct-turn yaw are still logged to CSV but not displayed on the dashboard.
-
-`distance traveled` is the total ground-path distance of the car during an episode, measured by summing step-to-step `x/y` movement.
+The dashboard reads from `metrics/dribble_episode_metrics.csv` and `metrics/dribble_phase4_metrics.csv`. Wall approach penalty and near-wall carry seconds are still logged to CSV but not displayed on the dashboard.
 
 ## Checkpoints
 

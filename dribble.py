@@ -1,4 +1,4 @@
-from typing import Any, Dict, List, Optional, Tuple
+from typing import Any, Dict, List, Optional
 
 import numpy as np
 
@@ -20,18 +20,11 @@ LOOP_WARNING_Y = common_values.BACK_WALL_Y - 2550.0
 
 EASY_CURRICULUM_EPISODES = 2500
 MIXED_CURRICULUM_EPISODES = 8000
+
+BALL_GROUND_THRESHOLD = 100.0
 BREADCRUMB_REACHED_DISTANCE = 500.0
 BREADCRUMB_SUCCESS_BONUS = 1.4
-
-STALL_RADIUS = 550.0
-STALL_GRACE_STEPS = int(5 * DECISIONS_PER_SECOND)
-DISTANCE_REWARD_SCALE = 1 / 150.0
-STALL_PENALTY = 0.03
-LOOP_PROGRESS_REWARD_SCALE = 1 / 260.0
 BREADCRUMB_PROGRESS_REWARD_SCALE = 1 / 260.0
-YAW_PROGRESS_REWARD_SCALE = 0.42
-LOOP_TANGENT_ALIGNMENT_REWARD_SCALE = 0.09
-TURN_LATERAL_REWARD_SCALE = 0.06
 WALL_PENALTY_SCALE = 0.035
 CORNER_PENALTY_SCALE = 0.06
 WALL_APPROACH_PENALTY_SCALE = 0.09
@@ -41,6 +34,14 @@ GOAL_MOUTH_X_LIMIT = common_values.GOAL_CENTER_TO_POST + 140.0
 GOAL_MOUTH_Y_LIMIT = common_values.BACK_WALL_Y - 120.0
 BALL_FORWARD_OFFSET = 35.0
 BALL_UP_OFFSET = 141.0
+
+# Breadcrumb types and their arc parameters: (arc_step_min, arc_step_max, arc_step_mid, min_distance, max_distance)
+_BREADCRUMB_ARC_PARAMS = {
+    "gentle":   (0.12, 0.25, 0.19, 800.0,  1600.0),
+    "sharp":    (0.50, 0.85, 0.68, 1200.0, 2800.0),
+    "straight": (0.02, 0.08, 0.05, 600.0,  1400.0),
+    "flip":     (0.12, 0.25, 0.19, 800.0,  1600.0),  # same arc as gentle, but direction flips
+}
 
 CURRENT_TURN_TARGET_XY = None
 CURRENT_LOOP_STATE = None
@@ -61,7 +62,7 @@ class DribbleStartMutator(StateMutator[GameState]):
         difficulty = sample_waypoint_difficulty(self.episode_counter, self.rng)
         lane_scale = sample_lane_scale(difficulty, self.rng)
         turn_direction = 1.0 if self.episode_counter % 2 == 1 else -1.0
-        base_profile = waypoint_profile(difficulty, 0, lane_scale)
+        base_profile = waypoint_profile(difficulty, lane_scale)
 
         spawn_angle = float(self.rng.uniform(-np.pi, np.pi))
         spawn_xy = build_spawn_position(spawn_angle, base_profile, self.rng)
@@ -74,6 +75,7 @@ class DribbleStartMutator(StateMutator[GameState]):
         up = np.array([0.0, 0.0, 1.0], dtype=np.float32)
         car_speed = float(self.rng.uniform(base_profile["speed_min"], base_profile["speed_max"]))
 
+        initial_crumb_type = sample_breadcrumb_type(difficulty, 0, self.rng)
         target_xy, target_angle, profile = build_turn_target_xy(
             spawn_xy,
             forward[:2],
@@ -81,9 +83,9 @@ class DribbleStartMutator(StateMutator[GameState]):
             turn_direction,
             self.rng,
             difficulty=difficulty,
-            chain_index=0,
             lane_scale=lane_scale,
             current_target_angle=spawn_angle,
+            breadcrumb_type=initial_crumb_type,
         )
 
         for index, car in enumerate(state.cars.values()):
@@ -104,6 +106,8 @@ class DribbleStartMutator(StateMutator[GameState]):
             shared_info["dribble_loop_profile"] = profile
             shared_info["dribble_loop_target_angle"] = target_angle
             shared_info["dribble_breadcrumbs_reached"] = 0
+            shared_info["dribble_direction_flips"] = 0
+            shared_info["dribble_episode_reward_sum"] = 0.0
 
             set_current_loop_state(
                 {
@@ -118,6 +122,8 @@ class DribbleStartMutator(StateMutator[GameState]):
                     "target_xy": target_xy,
                     "breadcrumb_index": 0,
                     "breadcrumbs_reached": 0,
+                    "direction_flips": 0,
+                    "episode_reward_sum": 0.0,
                 }
             )
 
@@ -142,7 +148,7 @@ class DribbleStartMutator(StateMutator[GameState]):
 
 class BallDroppedCondition(DoneCondition[AgentID, GameState]):
     """
-    End the episode when the ball is no longer plausibly being carried.
+    End the episode when the ball touches the ground or enters a goal.
     """
 
     def reset(self, agents: List[AgentID], initial_state: GameState, shared_info: Dict[str, Any]) -> None:
@@ -150,64 +156,37 @@ class BallDroppedCondition(DoneCondition[AgentID, GameState]):
 
     def is_done(self, agents: List[AgentID], state: GameState, shared_info: Dict[str, Any]) -> Dict[AgentID, bool]:
         ball_pos = state.ball.position
-        ball_too_low = ball_pos[2] < 115.0
-
-        done = ball_too_low or is_in_goal_mouth(ball_pos)
-        if not done and agents:
-            car = state.cars[agents[0]]
-            relative = ball_pos - car.physics.position
-            forward_offset, lateral_offset, vertical_offset, _ = get_dribble_alignment(car, ball_pos)
-            distance = float(np.linalg.norm(relative))
-            car_in_goal = is_in_goal_mouth(car.physics.position)
-
-            done = (
-                car_in_goal
-                or distance > 260.0
-                or abs(lateral_offset) > 150.0
-                or forward_offset < -45.0
-                or forward_offset > 195.0
-                or vertical_offset < 105.0
-                or vertical_offset > 260.0
-            )
-
+        done = (
+            ball_pos[2] < BALL_GROUND_THRESHOLD
+            or is_in_goal_mouth(ball_pos)
+            or (bool(agents) and is_in_goal_mouth(state.cars[agents[0]].physics.position))
+        )
         return {agent: done for agent in agents}
 
 
 class DribbleCarryReward(RewardFunction[AgentID, GameState, float]):
     """
-    Reward keeping the ball controlled while carrying it through loop turns.
+    Reward ball control and breadcrumb completion. Ball hitting the ground ends
+    the episode with a penalty. Breadcrumbs provide the primary positive signal.
     """
 
     def __init__(self):
         self.prev_positions: Dict[AgentID, np.ndarray] = {}
-        self.anchor_positions: Dict[AgentID, np.ndarray] = {}
-        self.stall_steps: Dict[AgentID, int] = {}
         self.prev_target_distances: Dict[AgentID, float] = {}
-        self.prev_headings: Dict[AgentID, float] = {}
-        self.prev_loop_angles: Dict[AgentID, float] = {}
         self.rng = np.random.default_rng()
 
     def reset(self, agents: List[AgentID], initial_state: GameState, shared_info: Dict[str, Any]) -> None:
         self.prev_positions = {}
-        self.anchor_positions = {}
-        self.stall_steps = {}
         self.prev_target_distances = {}
-        self.prev_headings = {}
-        self.prev_loop_angles = {}
 
         turn_target = shared_info.get("dribble_turn_target_xy")
-        profile = shared_info.get("dribble_loop_profile")
         for agent in agents:
             car = initial_state.cars[agent]
-            car_pos = car.physics.position[:2].copy()
-            self.prev_positions[agent] = car_pos
-            self.anchor_positions[agent] = car_pos
-            self.stall_steps[agent] = 0
-            self.prev_headings[agent] = heading_angle(car.physics.forward[:2])
+            self.prev_positions[agent] = car.physics.position[:2].copy()
             if turn_target is not None:
-                self.prev_target_distances[agent] = float(np.linalg.norm(np.asarray(turn_target) - car_pos))
-            if profile is not None:
-                self.prev_loop_angles[agent] = ellipse_angle(car_pos, profile["loop_x"], profile["loop_y"])
+                self.prev_target_distances[agent] = float(
+                    np.linalg.norm(np.asarray(turn_target) - car.physics.position[:2])
+                )
 
     def get_rewards(
         self,
@@ -219,39 +198,21 @@ class DribbleCarryReward(RewardFunction[AgentID, GameState, float]):
     ) -> Dict[AgentID, float]:
         rewards = {}
         ball_pos = state.ball.position
-        ball_vel = state.ball.linear_velocity
 
         for agent in agents:
             car = state.cars[agent]
             car_pos = car.physics.position[:2].copy()
-            forward_offset, lateral_offset, _, carry_quality = get_dribble_alignment(car, ball_pos)
+            _, _, _, carry_quality = get_dribble_alignment(car, ball_pos)
 
-            forward_speed = max(float(np.dot(car.physics.linear_velocity, car.physics.forward)), 0.0)
-            forward_speed_norm = min(forward_speed / 1400.0, 1.0)
-            velocity_match = np.exp(-(np.linalg.norm(ball_vel - car.physics.linear_velocity) / 300.0) ** 2)
-            reward = 0.10 * carry_quality + 0.55 * carry_quality * forward_speed_norm * velocity_match
-
-            prev_pos = self.prev_positions.get(agent, car_pos)
-            step_distance = float(np.linalg.norm(car_pos - prev_pos))
-            self.prev_positions[agent] = car_pos
+            # 1. Carry quality: small dense signal so the bot learns to keep the ball up
+            reward = 0.10 * carry_quality
 
             carrying = carry_quality > CARRY_THRESHOLD
             if carrying:
-                reward += carry_quality * min(step_distance * DISTANCE_REWARD_SCALE, 1.0)
+                # 2. Breadcrumb approach + success (handles direction flips internally)
+                reward += self._breadcrumb_rewards(agent, car, car_pos, carry_quality, shared_info)
 
-                anchor_pos = self.anchor_positions.get(agent, car_pos)
-                anchor_distance = float(np.linalg.norm(car_pos - anchor_pos))
-                if anchor_distance <= STALL_RADIUS:
-                    self.stall_steps[agent] = self.stall_steps.get(agent, 0) + 1
-                else:
-                    self.anchor_positions[agent] = car_pos
-                    self.stall_steps[agent] = 0
-
-                if self.stall_steps[agent] > STALL_GRACE_STEPS:
-                    reward -= STALL_PENALTY
-
-                reward += self._loop_rewards(agent, car, car_pos, forward_offset, lateral_offset, carry_quality, forward_speed_norm, shared_info)
-
+                # 3. Wall penalties
                 wall_pressure = wall_pressure_score(car_pos)
                 corner_pressure = corner_pressure_score(car_pos)
                 wall_approach = wall_approach_score(car_pos, car.physics.forward[:2], car.physics.linear_velocity[:2])
@@ -259,74 +220,68 @@ class DribbleCarryReward(RewardFunction[AgentID, GameState, float]):
                 reward -= CORNER_PENALTY_SCALE * carry_quality * corner_pressure
                 reward -= WALL_APPROACH_PENALTY_SCALE * carry_quality * wall_approach
             else:
-                self.anchor_positions[agent] = car_pos
-                self.stall_steps[agent] = 0
                 self.prev_target_distances.pop(agent, None)
-                self.prev_headings[agent] = heading_angle(car.physics.forward[:2])
-                profile = shared_info.get("dribble_loop_profile")
-                if profile is not None:
-                    self.prev_loop_angles[agent] = ellipse_angle(car_pos, profile["loop_x"], profile["loop_y"])
 
+            # 4. Terminal penalty
             if is_terminated.get(agent, False) or is_truncated.get(agent, False):
                 reward -= 1.0
 
+            shared_info["dribble_episode_reward_sum"] = (
+                shared_info.get("dribble_episode_reward_sum", 0.0) + reward
+            )
             rewards[agent] = float(reward)
 
+        # Mirror reward sum into loop state for metrics
+        loop_state = get_current_loop_state()
+        if loop_state is not None:
+            loop_state["episode_reward_sum"] = shared_info.get("dribble_episode_reward_sum", 0.0)
+            set_current_loop_state(loop_state)
+
+        self.prev_positions = {a: state.cars[a].physics.position[:2].copy() for a in agents}
         return rewards
 
-    def _loop_rewards(
+    def _breadcrumb_rewards(
         self,
         agent: AgentID,
         car,
         car_pos: np.ndarray,
-        forward_offset: float,
-        lateral_offset: float,
         carry_quality: float,
-        forward_speed_norm: float,
         shared_info: Dict[str, Any],
     ) -> float:
-        profile = shared_info.get("dribble_loop_profile")
         turn_target = shared_info.get("dribble_turn_target_xy")
-        turn_direction = float(shared_info.get("dribble_turn_direction", 1.0))
-        difficulty = shared_info.get("dribble_waypoint_difficulty", "medium")
-        lane_scale = float(shared_info.get("dribble_loop_lane_scale", 1.0))
-        if profile is None or turn_target is None:
+        if turn_target is None:
             return 0.0
 
-        reward = 0.0
-        current_heading = heading_angle(car.physics.forward[:2])
-        prev_heading = self.prev_headings.get(agent, current_heading)
-        yaw_delta = wrap_angle(current_heading - prev_heading)
-        self.prev_headings[agent] = current_heading
-        reward += YAW_PROGRESS_REWARD_SCALE * carry_quality * forward_speed_norm * max(turn_direction * yaw_delta, 0.0)
-
-        current_loop_angle = ellipse_angle(car_pos, profile["loop_x"], profile["loop_y"])
-        prev_loop_angle = self.prev_loop_angles.get(agent, current_loop_angle)
-        loop_delta = wrap_angle(current_loop_angle - prev_loop_angle)
-        self.prev_loop_angles[agent] = current_loop_angle
-        loop_radius = 0.5 * (profile["loop_x"] + profile["loop_y"])
-        loop_progress = max(turn_direction * loop_delta, 0.0) * loop_radius
-        reward += carry_quality * min(loop_progress * LOOP_PROGRESS_REWARD_SCALE, 1.0)
-
-        tangent_dir = ellipse_tangent(current_loop_angle, profile["loop_x"], profile["loop_y"], turn_direction)
-        tangent_alignment = max(float(np.dot(car.physics.forward[:2], tangent_dir)), 0.0)
-        reward += LOOP_TANGENT_ALIGNMENT_REWARD_SCALE * carry_quality * forward_speed_norm * tangent_alignment
-
-        desired_lateral = inside_turn_lateral_target(difficulty, turn_direction)
-        turn_lateral_alignment = np.exp(-((lateral_offset - desired_lateral) / 42.0) ** 2)
-        forward_alignment = np.exp(-((forward_offset - 35.0) / 55.0) ** 2)
-        reward += TURN_LATERAL_REWARD_SCALE * carry_quality * forward_speed_norm * turn_lateral_alignment * forward_alignment
+        difficulty = shared_info.get("dribble_waypoint_difficulty", "medium")
+        turn_direction = float(shared_info.get("dribble_turn_direction", 1.0))
+        lane_scale = float(shared_info.get("dribble_loop_lane_scale", 1.0))
+        breadcrumbs_reached = int(shared_info.get("dribble_breadcrumbs_reached", 0))
 
         target_xy = np.asarray(turn_target, dtype=np.float32)
-        to_target = target_xy - car_pos
-        target_distance = float(np.linalg.norm(to_target))
+        target_distance = float(np.linalg.norm(target_xy - car_pos))
         prev_target_distance = self.prev_target_distances.get(agent, target_distance)
         progress = max(prev_target_distance - target_distance, 0.0)
         self.prev_target_distances[agent] = target_distance
-        reward += carry_quality * min(progress * BREADCRUMB_PROGRESS_REWARD_SCALE * breadcrumb_progress_scale(difficulty), 1.0)
+
+        # Breadcrumb approach reward
+        reward = carry_quality * min(
+            progress * BREADCRUMB_PROGRESS_REWARD_SCALE * breadcrumb_progress_scale(difficulty), 1.0
+        )
 
         if target_distance <= BREADCRUMB_REACHED_DISTANCE:
             reward += breadcrumb_success_bonus(difficulty)
+            breadcrumbs_reached += 1
+
+            # Sample type for the next breadcrumb (may include "flip")
+            next_type = sample_breadcrumb_type(difficulty, breadcrumbs_reached, self.rng)
+            direction_flips = int(shared_info.get("dribble_direction_flips", 0))
+
+            if next_type == "flip":
+                turn_direction = -turn_direction
+                direction_flips += 1
+                shared_info["dribble_turn_direction"] = turn_direction
+                shared_info["dribble_direction_flips"] = direction_flips
+
             next_waypoint_index = int(shared_info.get("dribble_waypoint_index", 0)) + 1
             next_target_xy, next_target_angle, next_profile = build_turn_target_xy(
                 car_pos,
@@ -335,16 +290,17 @@ class DribbleCarryReward(RewardFunction[AgentID, GameState, float]):
                 turn_direction,
                 self.rng,
                 difficulty=difficulty,
-                chain_index=next_waypoint_index,
                 lane_scale=lane_scale,
-                current_target_angle=float(shared_info.get("dribble_loop_target_angle", current_loop_angle)),
+                current_target_angle=float(shared_info.get("dribble_loop_target_angle", 0.0)),
+                breadcrumb_type=next_type,
             )
-            breadcrumbs_reached = int(shared_info.get("dribble_breadcrumbs_reached", 0)) + 1
+
             shared_info["dribble_turn_target_xy"] = next_target_xy
             shared_info["dribble_waypoint_index"] = next_waypoint_index
             shared_info["dribble_loop_profile"] = next_profile
             shared_info["dribble_loop_target_angle"] = next_target_angle
             shared_info["dribble_breadcrumbs_reached"] = breadcrumbs_reached
+
             set_current_loop_state(
                 {
                     "turn_direction": turn_direction,
@@ -358,6 +314,8 @@ class DribbleCarryReward(RewardFunction[AgentID, GameState, float]):
                     "target_xy": next_target_xy,
                     "breadcrumb_index": next_waypoint_index,
                     "breadcrumbs_reached": breadcrumbs_reached,
+                    "direction_flips": direction_flips,
+                    "episode_reward_sum": shared_info.get("dribble_episode_reward_sum", 0.0),
                 }
             )
             self.prev_target_distances[agent] = float(np.linalg.norm(next_target_xy - car_pos))
@@ -380,7 +338,10 @@ def get_dribble_alignment(car, ball_pos):
 
 def build_spawn_position(spawn_angle: float, profile: Dict[str, float], rng) -> np.ndarray:
     base_xy = ellipse_point(spawn_angle, profile["loop_x"], profile["loop_y"])
-    normal = safe_normalize(np.array([base_xy[0] / max(profile["loop_x"], 1.0), base_xy[1] / max(profile["loop_y"], 1.0)], dtype=np.float32))
+    normal = safe_normalize(np.array(
+        [base_xy[0] / max(profile["loop_x"], 1.0), base_xy[1] / max(profile["loop_y"], 1.0)],
+        dtype=np.float32,
+    ))
     tangent = ellipse_tangent(spawn_angle, profile["loop_x"], profile["loop_y"], 1.0)
     spawn_xy = base_xy.copy()
     spawn_xy += normal * float(rng.uniform(-profile["spawn_normal_noise"], profile["spawn_normal_noise"]))
@@ -397,14 +358,16 @@ def build_turn_target_xy(
     turn_direction,
     rng,
     difficulty="medium",
-    chain_index=0,
     lane_scale=1.0,
     current_target_angle=None,
+    breadcrumb_type="gentle",
 ):
     car_pos_xy = np.asarray(car_pos_xy, dtype=np.float32)
     forward_xy = safe_normalize(forward_xy)
     _ = right_xy
-    profile = waypoint_profile(difficulty, chain_index, lane_scale)
+    profile = waypoint_profile(difficulty, lane_scale)
+    arc_min, arc_max, arc_mid, dist_min, dist_max = breadcrumb_type_arc_params(breadcrumb_type)
+
     base_angle = ellipse_angle(car_pos_xy, profile["loop_x"], profile["loop_y"])
     if current_target_angle is not None:
         base_angle = float(current_target_angle)
@@ -412,7 +375,7 @@ def build_turn_target_xy(
     best_target: Optional[np.ndarray] = None
     best_angle: Optional[float] = None
     best_score = -np.inf
-    for delta in np.linspace(profile["arc_step_min"], profile["arc_step_max"], 6):
+    for delta in np.linspace(arc_min, arc_max, 6):
         target_angle = wrap_angle(base_angle + float(turn_direction) * float(delta))
         target_xy = ellipse_point(target_angle, profile["loop_x"], profile["loop_y"])
         if not breadcrumb_segment_is_safe(car_pos_xy, target_xy, profile["safe_x"], profile["safe_y"]):
@@ -420,7 +383,7 @@ def build_turn_target_xy(
 
         to_target = target_xy - car_pos_xy
         distance = float(np.linalg.norm(to_target))
-        if distance < profile["min_distance"] or distance > profile["max_distance"]:
+        if distance < dist_min or distance > dist_max:
             continue
 
         target_dir = safe_normalize(to_target)
@@ -438,7 +401,7 @@ def build_turn_target_xy(
             best_angle = target_angle
 
     if best_target is None or best_angle is None:
-        fallback_angle = wrap_angle(base_angle + float(turn_direction) * profile["arc_step_mid"])
+        fallback_angle = wrap_angle(base_angle + float(turn_direction) * arc_mid)
         best_target = ellipse_point(fallback_angle, profile["loop_x"], profile["loop_y"])
         best_target[0] = float(np.clip(best_target[0], -profile["safe_x"], profile["safe_x"]))
         best_target[1] = float(np.clip(best_target[1], -profile["safe_y"], profile["safe_y"]))
@@ -453,6 +416,34 @@ def build_turn_target_xy(
         target_xy = best_target.astype(np.float32)
 
     return target_xy.astype(np.float32), float(best_angle), profile
+
+
+def sample_breadcrumb_type(difficulty: str, breadcrumbs_reached: int, rng) -> str:
+    """Sample a breadcrumb type for the next waypoint. Flips are gated by breadcrumbs_reached."""
+    if difficulty == "easy":
+        weights = [0.55, 0.05, 0.35, 0.05]
+        flip_min = 5
+    elif difficulty == "hard":
+        weights = [0.20, 0.30, 0.15, 0.35]
+        flip_min = 2
+    else:  # medium
+        weights = [0.30, 0.20, 0.20, 0.30]
+        flip_min = 3
+
+    if breadcrumbs_reached < flip_min:
+        # Redistribute flip weight to gentle
+        weights = list(weights)
+        weights[0] += weights[3]
+        weights[3] = 0.0
+
+    weights_arr = np.asarray(weights, dtype=np.float64)
+    weights_arr /= weights_arr.sum()
+    return str(rng.choice(["gentle", "sharp", "straight", "flip"], p=weights_arr))
+
+
+def breadcrumb_type_arc_params(breadcrumb_type: str):
+    """Return (arc_step_min, arc_step_max, arc_step_mid, min_distance, max_distance)."""
+    return _BREADCRUMB_ARC_PARAMS.get(breadcrumb_type, _BREADCRUMB_ARC_PARAMS["gentle"])
 
 
 def sample_waypoint_difficulty(episode_counter, rng):
@@ -473,7 +464,8 @@ def sample_lane_scale(difficulty: str, rng) -> float:
     return float(rng.uniform(0.93, 1.0))
 
 
-def waypoint_profile(difficulty, chain_index, lane_scale=1.0):
+def waypoint_profile(difficulty, lane_scale=1.0):
+    """Return ellipse geometry, safe bounds, spawn noise and speed params for the given difficulty."""
     difficulty = str(difficulty)
     if difficulty == "easy":
         base_safe_x = LOOP_SAFE_X - 260.0
@@ -483,11 +475,6 @@ def waypoint_profile(difficulty, chain_index, lane_scale=1.0):
             "safe_y": base_safe_y * lane_scale,
             "loop_x": (base_safe_x - 170.0) * lane_scale,
             "loop_y": (base_safe_y - 190.0) * lane_scale,
-            "arc_step_min": 0.16 + 0.03 * min(chain_index, 4),
-            "arc_step_max": 0.32 + 0.04 * min(chain_index, 4),
-            "arc_step_mid": 0.26 + 0.035 * min(chain_index, 4),
-            "min_distance": 850.0,
-            "max_distance": 1900.0,
             "target_jitter": 50.0,
             "spawn_normal_noise": 70.0,
             "spawn_tangent_noise": 110.0,
@@ -503,11 +490,6 @@ def waypoint_profile(difficulty, chain_index, lane_scale=1.0):
             "safe_y": base_safe_y * min(lane_scale, 1.02),
             "loop_x": (base_safe_x - 150.0) * min(lane_scale, 1.02),
             "loop_y": (base_safe_y - 170.0) * min(lane_scale, 1.02),
-            "arc_step_min": 0.42 + 0.05 * min(chain_index, 4),
-            "arc_step_max": 0.72 + 0.06 * min(chain_index, 4),
-            "arc_step_mid": 0.57 + 0.055 * min(chain_index, 4),
-            "min_distance": 1400.0,
-            "max_distance": 3200.0,
             "target_jitter": 85.0,
             "spawn_normal_noise": 95.0,
             "spawn_tangent_noise": 140.0,
@@ -515,6 +497,7 @@ def waypoint_profile(difficulty, chain_index, lane_scale=1.0):
             "speed_max": 700.0,
             "yaw_noise": 0.16,
         }
+    # medium
     base_safe_x = LOOP_SAFE_X - 120.0
     base_safe_y = LOOP_SAFE_Y - 160.0
     return {
@@ -522,11 +505,6 @@ def waypoint_profile(difficulty, chain_index, lane_scale=1.0):
         "safe_y": base_safe_y * lane_scale,
         "loop_x": (base_safe_x - 160.0) * lane_scale,
         "loop_y": (base_safe_y - 180.0) * lane_scale,
-        "arc_step_min": 0.28 + 0.04 * min(chain_index, 4),
-        "arc_step_max": 0.50 + 0.05 * min(chain_index, 4),
-        "arc_step_mid": 0.39 + 0.045 * min(chain_index, 4),
-        "min_distance": 1100.0,
-        "max_distance": 2500.0,
         "target_jitter": 65.0,
         "spawn_normal_noise": 80.0,
         "spawn_tangent_noise": 120.0,
@@ -552,16 +530,6 @@ def breadcrumb_success_bonus(difficulty):
     return BREADCRUMB_SUCCESS_BONUS
 
 
-def inside_turn_lateral_target(difficulty: str, turn_direction: float) -> float:
-    if difficulty == "easy":
-        magnitude = 12.0
-    elif difficulty == "hard":
-        magnitude = 20.0
-    else:
-        magnitude = 16.0
-    return -float(turn_direction) * magnitude
-
-
 def heading_angle(forward_xy) -> float:
     return float(np.arctan2(float(forward_xy[1]), float(forward_xy[0])))
 
@@ -572,10 +540,7 @@ def wrap_angle(angle: float) -> float:
 
 def ellipse_point(angle: float, loop_x: float, loop_y: float) -> np.ndarray:
     return np.array(
-        [
-            loop_x * np.cos(angle),
-            loop_y * np.sin(angle),
-        ],
+        [loop_x * np.cos(angle), loop_y * np.sin(angle)],
         dtype=np.float32,
     )
 
@@ -589,10 +554,7 @@ def ellipse_angle(position_xy, loop_x: float, loop_y: float) -> float:
 
 def ellipse_tangent(angle: float, loop_x: float, loop_y: float, turn_direction: float) -> np.ndarray:
     tangent = np.array(
-        [
-            -loop_x * np.sin(angle),
-            loop_y * np.cos(angle),
-        ],
+        [-loop_x * np.sin(angle), loop_y * np.cos(angle)],
         dtype=np.float32,
     )
     if turn_direction < 0.0:
@@ -625,7 +587,10 @@ def breadcrumb_segment_is_safe(car_pos_xy, target_xy, safe_x: float, safe_y: flo
 
 def set_current_turn_target_xy(turn_target_xy):
     global CURRENT_TURN_TARGET_XY
-    CURRENT_TURN_TARGET_XY = None if turn_target_xy is None else np.asarray(turn_target_xy, dtype=np.float32).copy()
+    CURRENT_TURN_TARGET_XY = (
+        None if turn_target_xy is None
+        else np.asarray(turn_target_xy, dtype=np.float32).copy()
+    )
 
 
 def get_current_turn_target_xy():
@@ -687,7 +652,6 @@ def near_wall_warning_score(car_pos_xy) -> float:
 def wall_approach_score(car_pos_xy, forward_xy, velocity_xy) -> float:
     velocity_mag = float(np.linalg.norm(velocity_xy))
     travel_dir = safe_normalize(velocity_xy if velocity_mag > 60.0 else forward_xy)
-    outward = np.zeros(2, dtype=np.float32)
     x_warning = max(0.0, (abs(float(car_pos_xy[0])) - LOOP_WARNING_X) / max(common_values.SIDE_WALL_X - LOOP_WARNING_X, 1.0))
     y_warning = max(0.0, (abs(float(car_pos_xy[1])) - LOOP_WARNING_Y) / max(common_values.BACK_WALL_Y - LOOP_WARNING_Y, 1.0))
 

@@ -14,7 +14,6 @@ from dribble import (
     CARRY_THRESHOLD,
     DECISIONS_PER_SECOND,
     WALL_APPROACH_PENALTY_SCALE,
-    ellipse_angle,
     get_current_loop_state,
     get_dribble_alignment,
     heading_angle,
@@ -126,10 +125,9 @@ def _load_metric_history():
 def _load_phase4_history():
     history = {
         "episodes": [],
-        "carry_distance": [],
-        "loop_progress": [],
-        "correct_turn_yaw": [],
         "breadcrumbs_reached": [],
+        "direction_flips": [],
+        "avg_reward": [],
         "wall_approach_penalty": [],
         "near_wall_carry_seconds": [],
     }
@@ -138,18 +136,19 @@ def _load_phase4_history():
 
     with PHASE4_METRICS_CSV.open(newline="") as handle:
         reader = csv.reader(handle)
-        next(reader, None)
+        header = next(reader, None)
+        if header is None or "breadcrumbs_reached" not in header:
+            return history  # old format, skip
         for row in reader:
-            if len(row) < 7:
+            if len(row) < 6:
                 continue
             try:
                 history["episodes"].append(int(row[0]))
-                history["carry_distance"].append(float(row[1]))
-                history["loop_progress"].append(float(row[2]))
-                history["correct_turn_yaw"].append(float(row[3]))
-                history["breadcrumbs_reached"].append(float(row[4]))
-                history["wall_approach_penalty"].append(float(row[5]))
-                history["near_wall_carry_seconds"].append(float(row[6]))
+                history["breadcrumbs_reached"].append(float(row[1]))
+                history["direction_flips"].append(float(row[2]))
+                history["avg_reward"].append(float(row[3]))
+                history["wall_approach_penalty"].append(float(row[4]))
+                history["near_wall_carry_seconds"].append(float(row[5]))
             except ValueError:
                 continue
     return history
@@ -368,11 +367,11 @@ class DribbleDashboard:
         chart_specs = [
             ("carry_time", "Carry Time Per Episode (s)", "#2563eb", "Episode",
              PLOT_PADDING, top_y),
-            ("carry_distance", "Carry Distance (uu)", "#0891b2", "Tracked Episode",
-             PLOT_PADDING + chart_w + chart_gap_x, top_y),
-            ("loop_progress", "Loop Progress Per Episode (uu)", "#7c3aed", "Tracked Episode",
-             PLOT_PADDING, top_y + chart_h + chart_gap_y),
             ("breadcrumbs_reached", "Breadcrumbs Reached Per Episode", "#b45309", "Tracked Episode",
+             PLOT_PADDING + chart_w + chart_gap_x, top_y),
+            ("avg_reward", "Avg Episode Reward", "#7c3aed", "Tracked Episode",
+             PLOT_PADDING, top_y + chart_h + chart_gap_y),
+            ("direction_flips", "Direction Flips Per Episode", "#0891b2", "Tracked Episode",
              PLOT_PADDING + chart_w + chart_gap_x, top_y + chart_h + chart_gap_y),
         ]
         for key, title, color, x_prefix, x0, y0 in chart_specs:
@@ -591,22 +590,21 @@ class DribbleMetricsLogger:
 
         phase4 = _load_phase4_history()
         self.phase4_episodes = phase4["episodes"]
-        self.carry_distance = phase4["carry_distance"]
-        self.loop_progress = phase4["loop_progress"]
-        self.correct_turn_yaw = phase4["correct_turn_yaw"]
         self.breadcrumbs_reached = phase4["breadcrumbs_reached"]
+        self.direction_flips = phase4["direction_flips"]
+        self.avg_reward = phase4["avg_reward"]
         self.wall_approach_penalty = phase4["wall_approach_penalty"]
         self.near_wall_carry_seconds = phase4["near_wall_carry_seconds"]
 
-        self.carry_distance_rolling = _rolling_average(self.carry_distance, ROLLING_WINDOW)
-        self.carry_distance_p05 = _rolling_percentile(self.carry_distance, ROLLING_WINDOW, 5)
-        self.carry_distance_p95 = _rolling_percentile(self.carry_distance, ROLLING_WINDOW, 95)
-        self.loop_progress_rolling = _rolling_average(self.loop_progress, ROLLING_WINDOW)
-        self.loop_progress_p05 = _rolling_percentile(self.loop_progress, ROLLING_WINDOW, 5)
-        self.loop_progress_p95 = _rolling_percentile(self.loop_progress, ROLLING_WINDOW, 95)
         self.breadcrumbs_reached_rolling = _rolling_average(self.breadcrumbs_reached, ROLLING_WINDOW)
         self.breadcrumbs_reached_p05 = _rolling_percentile(self.breadcrumbs_reached, ROLLING_WINDOW, 5)
         self.breadcrumbs_reached_p95 = _rolling_percentile(self.breadcrumbs_reached, ROLLING_WINDOW, 95)
+        self.direction_flips_rolling = _rolling_average(self.direction_flips, ROLLING_WINDOW)
+        self.direction_flips_p05 = _rolling_percentile(self.direction_flips, ROLLING_WINDOW, 5)
+        self.direction_flips_p95 = _rolling_percentile(self.direction_flips, ROLLING_WINDOW, 95)
+        self.avg_reward_rolling = _rolling_average(self.avg_reward, ROLLING_WINDOW)
+        self.avg_reward_p05 = _rolling_percentile(self.avg_reward, ROLLING_WINDOW, 5)
+        self.avg_reward_p95 = _rolling_percentile(self.avg_reward, ROLLING_WINDOW, 95)
 
         self.markers = _load_markers()
         self.episode_counter = len(self.carry_seconds)
@@ -627,10 +625,9 @@ class DribbleMetricsLogger:
                 writer.writerow(
                     [
                         "episode",
-                        "carry_distance_uu",
-                        "loop_progress_uu",
-                        "correct_turn_yaw_rad",
                         "breadcrumbs_reached",
+                        "direction_flips",
+                        "avg_reward",
                         "wall_approach_penalty",
                         "near_wall_carry_seconds",
                     ]
@@ -651,21 +648,20 @@ class DribbleMetricsLogger:
             "carry_p05",
             "carry_p95",
             "phase4_episodes",
-            "carry_distance",
-            "loop_progress",
-            "correct_turn_yaw",
             "breadcrumbs_reached",
+            "direction_flips",
+            "avg_reward",
             "wall_approach_penalty",
             "near_wall_carry_seconds",
-            "carry_distance_rolling",
-            "carry_distance_p05",
-            "carry_distance_p95",
-            "loop_progress_rolling",
-            "loop_progress_p05",
-            "loop_progress_p95",
             "breadcrumbs_reached_rolling",
             "breadcrumbs_reached_p05",
             "breadcrumbs_reached_p95",
+            "direction_flips_rolling",
+            "direction_flips_p05",
+            "direction_flips_p95",
+            "avg_reward_rolling",
+            "avg_reward_p05",
+            "avg_reward_p95",
             "markers",
         ):
             state[key] = []
@@ -704,23 +700,22 @@ class DribbleMetricsLogger:
         current_heading = heading_angle(car.physics.forward[:2])
 
         loop_state = get_current_loop_state()
-        loop_angle = -1.0
-        loop_radius = 0.0
         turn_direction = 0.0
         breadcrumbs_reached = 0.0
+        direction_flips = 0.0
         target_x = 0.0
         target_y = 0.0
         has_target = 0.0
         loop_x = 0.0
         loop_y = 0.0
+        episode_reward_sum = 0.0
         if loop_state is not None:
             loop_x = float(loop_state.get("loop_x", 0.0))
             loop_y = float(loop_state.get("loop_y", 0.0))
-            if loop_x > 0.0 and loop_y > 0.0:
-                loop_angle = ellipse_angle(car.physics.position[:2], loop_x, loop_y)
-                loop_radius = 0.5 * (loop_x + loop_y)
             turn_direction = float(loop_state.get("turn_direction", 0.0))
             breadcrumbs_reached = float(loop_state.get("breadcrumbs_reached", 0.0))
+            direction_flips = float(loop_state.get("direction_flips", 0.0))
+            episode_reward_sum = float(loop_state.get("episode_reward_sum", 0.0))
             target_xy = loop_state.get("target_xy")
             if target_xy is not None:
                 target_x = float(target_xy[0])
@@ -734,6 +729,12 @@ class DribbleMetricsLogger:
         )
         near_wall_flag = 1.0 if carrying > 0.5 and near_wall_warning_score(car.physics.position[:2]) > 0.0 else 0.0
 
+        # Metric array layout (19 elements):
+        # 0: worker_pid, 1: tick_count, 2: car_x, 3: car_y, 4: heading,
+        # 5: ball_x, 6: ball_y, 7: carrying, 8: turn_direction,
+        # 9: breadcrumbs_reached, 10: direction_flips, 11: wall_approach_penalty,
+        # 12: near_wall_flag, 13: target_x, 14: target_y, 15: has_target,
+        # 16: loop_x, 17: loop_y, 18: episode_reward_sum
         metric = np.array(
             [
                 float(self.worker_pid),
@@ -744,10 +745,9 @@ class DribbleMetricsLogger:
                 float(game_state.ball.position[0]),
                 float(game_state.ball.position[1]),
                 carrying,
-                loop_angle,
-                loop_radius,
                 turn_direction,
                 breadcrumbs_reached,
+                direction_flips,
                 wall_approach_penalty,
                 near_wall_flag,
                 target_x,
@@ -755,6 +755,7 @@ class DribbleMetricsLogger:
                 has_target,
                 loop_x,
                 loop_y,
+                episode_reward_sum,
             ],
             dtype=np.float32,
         )
@@ -775,18 +776,15 @@ class DribbleMetricsLogger:
         if wandb_run is not None and self.carry_seconds:
             log_data = {
                 "Dribble/Latest Carry Seconds": self.carry_seconds[-1],
-                "Dribble/Latest Distance": self.distances[-1],
                 "Dribble/Mean Carry Seconds (Last 20)": float(np.mean(self.carry_seconds[-20:])),
-                "Dribble/Mean Distance (Last 20)": float(np.mean(self.distances[-20:])),
                 "Cumulative Timesteps": cumulative_timesteps,
             }
-            if self.carry_distance:
+            if self.breadcrumbs_reached:
                 log_data.update(
                     {
-                        "Dribble/Latest Carry Distance": self.carry_distance[-1],
-                        "Dribble/Latest Loop Progress": self.loop_progress[-1],
-                        "Dribble/Latest Correct Turn Yaw": self.correct_turn_yaw[-1],
                         "Dribble/Latest Breadcrumbs Reached": self.breadcrumbs_reached[-1],
+                        "Dribble/Latest Direction Flips": self.direction_flips[-1],
+                        "Dribble/Latest Avg Reward": self.avg_reward[-1],
                         "Dribble/Latest Wall Approach Penalty": self.wall_approach_penalty[-1],
                         "Dribble/Latest Near-Wall Carry Seconds": self.near_wall_carry_seconds[-1],
                     }
@@ -807,7 +805,7 @@ class DribbleMetricsLogger:
             self.last_dashboard_time = now
 
     def _build_plot_data(self):
-        tracked_count = len(self.carry_distance_rolling)
+        tracked_count = len(self.breadcrumbs_reached_rolling)
         tracked_markers = _project_markers_to_tracked(self.markers, self.phase4_episodes)
         return {
             "carry_time": {
@@ -817,24 +815,24 @@ class DribbleMetricsLogger:
                 "markers": self.markers,
                 "x_end_label": self.episode_counter,
             },
-            "carry_distance": {
-                "mean": self.carry_distance_rolling,
-                "p05": self.carry_distance_p05,
-                "p95": self.carry_distance_p95,
-                "markers": tracked_markers,
-                "x_end_label": tracked_count,
-            },
-            "loop_progress": {
-                "mean": self.loop_progress_rolling,
-                "p05": self.loop_progress_p05,
-                "p95": self.loop_progress_p95,
-                "markers": tracked_markers,
-                "x_end_label": tracked_count,
-            },
             "breadcrumbs_reached": {
                 "mean": self.breadcrumbs_reached_rolling,
                 "p05": self.breadcrumbs_reached_p05,
                 "p95": self.breadcrumbs_reached_p95,
+                "markers": tracked_markers,
+                "x_end_label": tracked_count,
+            },
+            "avg_reward": {
+                "mean": self.avg_reward_rolling,
+                "p05": self.avg_reward_p05,
+                "p95": self.avg_reward_p95,
+                "markers": tracked_markers,
+                "x_end_label": tracked_count,
+            },
+            "direction_flips": {
+                "mean": self.direction_flips_rolling,
+                "p05": self.direction_flips_p05,
+                "p95": self.direction_flips_p95,
                 "markers": tracked_markers,
                 "x_end_label": tracked_count,
             },
@@ -847,43 +845,36 @@ class DribbleMetricsLogger:
         current_heading = float(metric[4])
         ball_position = metric[5:7].astype(np.float32)
         carrying = bool(metric[7] > 0.5)
-        loop_angle = float(metric[8])
-        loop_radius = float(metric[9])
-        turn_direction = float(metric[10])
-        breadcrumbs_reached = float(metric[11])
-        wall_approach_penalty = float(metric[12])
-        near_wall_flag = bool(metric[13] > 0.5)
-        target_position = metric[14:16].astype(np.float32)
-        has_target = bool(metric[16] > 0.5)
-        loop_x = float(metric[17])
-        loop_y = float(metric[18])
+        turn_direction = float(metric[8])
+        breadcrumbs_reached = float(metric[9])
+        direction_flips = float(metric[10])
+        wall_approach_penalty = float(metric[11])
+        near_wall_flag = bool(metric[12] > 0.5)
+        target_position = metric[13:15].astype(np.float32)
+        has_target = bool(metric[15] > 0.5)
+        loop_x = float(metric[16])
+        loop_y = float(metric[17])
+        episode_reward_sum = float(metric[18])
+
+        def _initial_frame():
+            return self._build_episode_frame(
+                position, current_heading, ball_position, target_position, has_target, loop_x, loop_y,
+            )
 
         state = self.process_state.get(pid)
         if state is None:
             self.process_state[pid] = {
                 "last_tick": tick_count,
                 "last_pos": position,
-                "last_heading": current_heading,
-                "last_loop_angle": loop_angle if loop_angle >= 0.0 else None,
                 "carry_steps": 1 if carrying else 0,
+                "total_steps": 1,
                 "distance": 0.0,
-                "carry_distance": 0.0,
-                "loop_progress": 0.0,
-                "correct_turn_yaw": 0.0,
                 "breadcrumbs_reached": breadcrumbs_reached,
+                "direction_flips": direction_flips,
+                "episode_reward_sum": episode_reward_sum,
                 "wall_approach_penalty": wall_approach_penalty,
                 "near_wall_carry_steps": 1 if carrying and near_wall_flag else 0,
-                "frames": [
-                    self._build_episode_frame(
-                        position,
-                        current_heading,
-                        ball_position,
-                        target_position,
-                        has_target,
-                        loop_x,
-                        loop_y,
-                    )
-                ],
+                "frames": [_initial_frame()],
             }
             return
 
@@ -891,70 +882,38 @@ class DribbleMetricsLogger:
             self._finalize_episode(state)
             state["last_tick"] = tick_count
             state["last_pos"] = position
-            state["last_heading"] = current_heading
-            state["last_loop_angle"] = loop_angle if loop_angle >= 0.0 else None
             state["carry_steps"] = 1 if carrying else 0
+            state["total_steps"] = 1
             state["distance"] = 0.0
-            state["carry_distance"] = 0.0
-            state["loop_progress"] = 0.0
-            state["correct_turn_yaw"] = 0.0
             state["breadcrumbs_reached"] = breadcrumbs_reached
+            state["direction_flips"] = direction_flips
+            state["episode_reward_sum"] = episode_reward_sum
             state["wall_approach_penalty"] = wall_approach_penalty
             state["near_wall_carry_steps"] = 1 if carrying and near_wall_flag else 0
-            state["frames"] = [
-                self._build_episode_frame(
-                    position,
-                    current_heading,
-                    ball_position,
-                    target_position,
-                    has_target,
-                    loop_x,
-                    loop_y,
-                )
-            ]
+            state["frames"] = [_initial_frame()]
             return
 
         step_distance = float(np.linalg.norm(position - state["last_pos"]))
         state["distance"] += step_distance
         state["carry_steps"] += 1 if carrying else 0
-        if carrying:
-            state["carry_distance"] += step_distance
-
-            heading_delta = wrap_angle(current_heading - state["last_heading"])
-            state["correct_turn_yaw"] += max(turn_direction * heading_delta, 0.0)
-
-            if loop_angle >= 0.0 and state["last_loop_angle"] is not None and loop_radius > 0.0:
-                loop_delta = wrap_angle(loop_angle - state["last_loop_angle"])
-                state["loop_progress"] += max(turn_direction * loop_delta, 0.0) * loop_radius
-
-            if near_wall_flag:
-                state["near_wall_carry_steps"] += 1
-
+        state["total_steps"] = state.get("total_steps", 0) + 1
+        if carrying and near_wall_flag:
+            state["near_wall_carry_steps"] += 1
         state["breadcrumbs_reached"] = max(state["breadcrumbs_reached"], breadcrumbs_reached)
+        state["direction_flips"] = max(state["direction_flips"], direction_flips)
+        state["episode_reward_sum"] = episode_reward_sum
         state["wall_approach_penalty"] += wall_approach_penalty
         state["last_pos"] = position
         state["last_tick"] = tick_count
-        state["last_heading"] = current_heading
-        state["last_loop_angle"] = loop_angle if loop_angle >= 0.0 else state["last_loop_angle"]
-        state["frames"].append(
-            self._build_episode_frame(
-                position,
-                current_heading,
-                ball_position,
-                target_position,
-                has_target,
-                loop_x,
-                loop_y,
-            )
-        )
+        state["frames"].append(_initial_frame())
 
     def _finalize_episode(self, state):
         carry_seconds = state["carry_steps"] / DECISIONS_PER_SECOND
         distance = state["distance"]
-        carry_distance = state["carry_distance"]
-        loop_progress = state["loop_progress"]
-        correct_turn_yaw = state["correct_turn_yaw"]
         breadcrumbs_reached = state["breadcrumbs_reached"]
+        direction_flips = state["direction_flips"]
+        total_steps = max(state.get("total_steps", 1), 1)
+        avg_reward = state["episode_reward_sum"] / total_steps
         wall_approach_penalty = state["wall_approach_penalty"]
         near_wall_carry_seconds = state["near_wall_carry_steps"] / DECISIONS_PER_SECOND
         self.episode_counter += 1
@@ -964,26 +923,25 @@ class DribbleMetricsLogger:
 
         self.phase4_episodes.append(self.episode_counter)
         _append_rolling_stats(
-            self.carry_distance,
-            self.carry_distance_rolling,
-            self.carry_distance_p05,
-            self.carry_distance_p95,
-            carry_distance,
-        )
-        _append_rolling_stats(
-            self.loop_progress,
-            self.loop_progress_rolling,
-            self.loop_progress_p05,
-            self.loop_progress_p95,
-            loop_progress,
-        )
-        self.correct_turn_yaw.append(correct_turn_yaw)
-        _append_rolling_stats(
             self.breadcrumbs_reached,
             self.breadcrumbs_reached_rolling,
             self.breadcrumbs_reached_p05,
             self.breadcrumbs_reached_p95,
             breadcrumbs_reached,
+        )
+        _append_rolling_stats(
+            self.direction_flips,
+            self.direction_flips_rolling,
+            self.direction_flips_p05,
+            self.direction_flips_p95,
+            direction_flips,
+        )
+        _append_rolling_stats(
+            self.avg_reward,
+            self.avg_reward_rolling,
+            self.avg_reward_p05,
+            self.avg_reward_p95,
+            avg_reward,
         )
         self.wall_approach_penalty.append(wall_approach_penalty)
         self.near_wall_carry_seconds.append(near_wall_carry_seconds)
@@ -997,10 +955,9 @@ class DribbleMetricsLogger:
             writer.writerow(
                 [
                     self.episode_counter,
-                    carry_distance,
-                    loop_progress,
-                    correct_turn_yaw,
                     breadcrumbs_reached,
+                    direction_flips,
+                    avg_reward,
                     wall_approach_penalty,
                     near_wall_carry_seconds,
                 ]
