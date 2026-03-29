@@ -54,6 +54,7 @@ models/           Saved PPO checkpoints (gitignored)
 
 ## macOS M-Series Notes
 
+- This repo is currently being developed on a `MacBook Air (MacBookAir10,1)` with an `Apple M1` chip, `8 CPU cores`, and `8 GB` RAM
 - `rocketsim` requires macOS 14+ for the ARM64 wheel
 - PyTorch MPS backend for GPU acceleration (`device="auto"` in `learner.py`)
 - Set `PYTORCH_ENABLE_MPS_FALLBACK=1` for unsupported MPS ops; or change to `device="cpu"` if MPS causes issues

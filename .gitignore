@@ -11,3 +11,5 @@ models-*/
 wandb/
 *.log
 rlviser
+artifacts/
+metrics/
