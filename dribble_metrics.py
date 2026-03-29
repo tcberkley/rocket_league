@@ -1,21 +1,52 @@
 import csv
+import json
 import os
 import time
 import tkinter as tk
 from pathlib import Path
 
 import numpy as np
+from PIL import Image, ImageDraw
+from rlgym.rocket_league import common_values
 
-from dribble import CARRY_THRESHOLD, DECISIONS_PER_SECOND, get_dribble_alignment
+from dribble import (
+    CARRY_THRESHOLD,
+    DECISIONS_PER_SECOND,
+    WALL_APPROACH_PENALTY_SCALE,
+    ellipse_angle,
+    get_current_loop_state,
+    get_dribble_alignment,
+    heading_angle,
+    near_wall_warning_score,
+    wall_approach_score,
+    wrap_angle,
+)
 
 ROOT_DIR = Path(__file__).resolve().parent
 METRICS_DIR = ROOT_DIR / "metrics"
+ARTIFACTS_DIR = ROOT_DIR / "artifacts"
+RECORD_GIFS_DIR = ARTIFACTS_DIR / "record_breakers"
 METRICS_CSV = METRICS_DIR / "dribble_episode_metrics.csv"
-PLOT_WIDTH = 1180
-PLOT_HEIGHT = 720
-PLOT_PADDING = 60
+PHASE4_METRICS_CSV = METRICS_DIR / "dribble_phase4_metrics.csv"
+METRICS_MARKERS_JSON = METRICS_DIR / "dribble_markers.json"
+
+MAX_PLOT_WIDTH = 1520
+MAX_PLOT_HEIGHT = 1280
+MIN_PLOT_WIDTH = 1080
+MIN_PLOT_HEIGHT = 860
+PLOT_PADDING = 50
 ROLLING_WINDOW = 50
-MAX_RENDER_POINTS = 480
+MAX_RENDER_POINTS = 420
+HEADER_FONT = ("Helvetica", 13, "bold")
+TITLE_FONT = ("Helvetica", 11, "bold")
+AXIS_FONT = ("Helvetica", 9)
+MARKER_FONT = ("Helvetica", 9, "bold")
+LEGEND_FONT = ("Helvetica", 9, "bold")
+RECORD_GIF_WIDTH = 1200
+RECORD_GIF_HEIGHT = 800
+RECORD_GIF_PADDING = 40
+RECORD_GIF_FRAME_STRIDE = 2
+RECORD_GIF_FRAME_DURATION_MS = 1000 // 12
 
 
 def _rolling_average(values, window):
@@ -29,6 +60,24 @@ def _rolling_average(values, window):
     totals = cumulative[indices + 1] - cumulative[starts]
     counts = indices - starts + 1
     return (totals / counts).astype(np.float32).tolist()
+
+
+def _rolling_percentile(values, window, percentile):
+    if not values:
+        return []
+
+    arr = np.asarray(values, dtype=np.float32)
+    prefix = [
+        float(np.percentile(arr[: index + 1], percentile))
+        for index in range(min(window - 1, len(arr)))
+    ]
+
+    if len(arr) < window:
+        return prefix
+
+    windows = np.lib.stride_tricks.sliding_window_view(arr, window)
+    full = np.percentile(windows, percentile, axis=1)
+    return prefix + full.astype(np.float32).tolist()
 
 
 def _compress_plot_series(values, max_points):
@@ -56,15 +105,82 @@ def _load_metric_history():
     if not METRICS_CSV.exists():
         return [], []
 
+    carry_seconds = []
+    distances = []
+    with METRICS_CSV.open(newline="") as handle:
+        reader = csv.reader(handle)
+        next(reader, None)
+        for row in reader:
+            if len(row) < 3:
+                continue
+            try:
+                carry_seconds.append(float(row[1]))
+                distances.append(float(row[2]))
+            except ValueError:
+                continue
+    return carry_seconds, distances
+
+
+def _load_phase4_history():
+    history = {
+        "episodes": [],
+        "carry_distance": [],
+        "loop_progress": [],
+        "correct_turn_yaw": [],
+        "breadcrumbs_reached": [],
+        "wall_approach_penalty": [],
+        "near_wall_carry_seconds": [],
+    }
+    if not PHASE4_METRICS_CSV.exists():
+        return history
+
+    with PHASE4_METRICS_CSV.open(newline="") as handle:
+        reader = csv.reader(handle)
+        next(reader, None)
+        for row in reader:
+            if len(row) < 7:
+                continue
+            try:
+                history["episodes"].append(int(row[0]))
+                history["carry_distance"].append(float(row[1]))
+                history["loop_progress"].append(float(row[2]))
+                history["correct_turn_yaw"].append(float(row[3]))
+                history["breadcrumbs_reached"].append(float(row[4]))
+                history["wall_approach_penalty"].append(float(row[5]))
+                history["near_wall_carry_seconds"].append(float(row[6]))
+            except ValueError:
+                continue
+    return history
+
+
+def _load_markers():
+    if not METRICS_MARKERS_JSON.exists():
+        return []
+
     try:
-        history = np.loadtxt(METRICS_CSV, delimiter=",", skiprows=1, ndmin=2)
-    except (OSError, ValueError):
-        return [], []
+        markers = json.loads(METRICS_MARKERS_JSON.read_text())
+    except (OSError, ValueError, json.JSONDecodeError):
+        return []
 
-    if history.size == 0 or history.shape[1] < 3:
-        return [], []
+    if not isinstance(markers, list):
+        return []
 
-    return history[:, 1].astype(np.float32).tolist(), history[:, 2].astype(np.float32).tolist()
+    out = []
+    for marker in markers:
+        if not isinstance(marker, dict):
+            continue
+        try:
+            episode = int(marker["episode"])
+        except (KeyError, TypeError, ValueError):
+            continue
+        out.append(
+            {
+                "episode": episode,
+                "label": str(marker.get("label", f"Phase @ {episode}")),
+                "color": str(marker.get("color", "#b91c1c")),
+            }
+        )
+    return out
 
 
 def _lighten_color(hex_color):
@@ -78,21 +194,129 @@ def _lighten_color(hex_color):
     return f"#{r:02x}{g:02x}{b:02x}"
 
 
+def _append_rolling_stats(series, rolling_mean, rolling_p05, rolling_p95, value):
+    series.append(value)
+    window_values = series[-ROLLING_WINDOW:]
+    rolling_mean.append(float(np.mean(window_values)))
+    rolling_p05.append(float(np.percentile(window_values, 5)))
+    rolling_p95.append(float(np.percentile(window_values, 95)))
+
+
+def _project_markers_to_tracked(markers, tracked_global_episodes):
+    projected = []
+    if not tracked_global_episodes:
+        return projected
+
+    for marker in markers:
+        for index, global_episode in enumerate(tracked_global_episodes, start=1):
+            if global_episode >= marker["episode"]:
+                projected.append(
+                    {
+                        "episode": index,
+                        "label": marker.get("label", f"Phase @ {marker['episode']}"),
+                        "color": marker.get("color", "#b91c1c"),
+                    }
+                )
+                break
+    return projected
+
+
+def _record_scale():
+    return min(
+        (RECORD_GIF_WIDTH - 2 * RECORD_GIF_PADDING) / (2 * common_values.SIDE_WALL_X),
+        (RECORD_GIF_HEIGHT - 2 * RECORD_GIF_PADDING) / (2 * common_values.BACK_WALL_Y),
+    )
+
+
+def _record_to_canvas(position_xy):
+    x = RECORD_GIF_WIDTH / 2 + float(position_xy[0]) * _record_scale()
+    y = RECORD_GIF_HEIGHT / 2 - float(position_xy[1]) * _record_scale()
+    return x, y
+
+
+def _rotated_triangle(center_x, center_y, angle, length=34, width=22):
+    points = [
+        (length / 2, 0),
+        (-length / 2, -width / 2),
+        (-length / 2, width / 2),
+    ]
+    out = []
+    for dx, dy in points:
+        px = center_x + dx * np.cos(angle) - dy * np.sin(angle)
+        py = center_y - (dx * np.sin(angle) + dy * np.cos(angle))
+        out.append((px, py))
+    return out
+
+
+def _draw_record_frame(frame, title):
+    image = Image.new("RGB", (RECORD_GIF_WIDTH, RECORD_GIF_HEIGHT), "#135d36")
+    draw = ImageDraw.Draw(image)
+
+    left, top = _record_to_canvas((-common_values.SIDE_WALL_X, common_values.BACK_WALL_Y))
+    right, bottom = _record_to_canvas((common_values.SIDE_WALL_X, -common_values.BACK_WALL_Y))
+    draw.rectangle((left, top, right, bottom), outline="#ecf7ec", width=4)
+
+    center_x = RECORD_GIF_WIDTH / 2
+    draw.line((center_x, top, center_x, bottom), fill="#ecf7ec", width=2)
+    circle_radius = 600 * _record_scale()
+    draw.ellipse(
+        (
+            center_x - circle_radius,
+            RECORD_GIF_HEIGHT / 2 - circle_radius,
+            center_x + circle_radius,
+            RECORD_GIF_HEIGHT / 2 + circle_radius,
+        ),
+        outline="#ecf7ec",
+        width=2,
+    )
+
+    loop_x = float(frame.get("loop_x", 0.0))
+    loop_y = float(frame.get("loop_y", 0.0))
+    if loop_x > 0.0 and loop_y > 0.0:
+        lane_left, lane_top = _record_to_canvas((-loop_x, loop_y))
+        lane_right, lane_bottom = _record_to_canvas((loop_x, -loop_y))
+        draw.ellipse((lane_left, lane_top, lane_right, lane_bottom), outline="#f59e0b", width=3)
+
+    target_x = float(frame.get("target_x", 0.0))
+    target_y = float(frame.get("target_y", 0.0))
+    if frame.get("has_target", False):
+        wp_x, wp_y = _record_to_canvas((target_x, target_y))
+        draw.ellipse((wp_x - 16, wp_y - 16, wp_x + 16, wp_y + 16), outline="#ff4fd8", width=4)
+        draw.line((wp_x - 20, wp_y, wp_x + 20, wp_y), fill="#ff4fd8", width=3)
+        draw.line((wp_x, wp_y - 20, wp_x, wp_y + 20), fill="#ff4fd8", width=3)
+        draw.text((wp_x + 14, wp_y - 28), "WP", fill="#ff4fd8")
+
+    ball_x, ball_y = _record_to_canvas((frame["ball_x"], frame["ball_y"]))
+    draw.ellipse((ball_x - 10, ball_y - 10, ball_x + 10, ball_y + 10), fill="#f8fafc")
+
+    car_x, car_y = _record_to_canvas((frame["car_x"], frame["car_y"]))
+    draw.polygon(_rotated_triangle(car_x, car_y, frame["heading"]), fill="#55a4ff", outline="#0f172a")
+    draw.text((car_x + 10, car_y - 10), "B1", fill="#f8fafc")
+
+    draw.text((16, 16), title, fill="#f8fafc")
+    return image
+
+
 class DribbleDashboard:
     def __init__(self):
         self.root = tk.Tk()
         self.root.title("Dribble Training Dashboard")
         self.root.protocol("WM_DELETE_WINDOW", self.close)
         self.closed = False
+        screen_width = max(int(self.root.winfo_screenwidth()), MIN_PLOT_WIDTH)
+        screen_height = max(int(self.root.winfo_screenheight()), MIN_PLOT_HEIGHT)
+        self.plot_width = max(MIN_PLOT_WIDTH, min(MAX_PLOT_WIDTH, screen_width - 120))
+        self.plot_height = max(760, min(MAX_PLOT_HEIGHT, screen_height - 140))
+        self.root.geometry(f"{self.plot_width}x{self.plot_height}+40+40")
         self.canvas = tk.Canvas(
             self.root,
-            width=PLOT_WIDTH,
-            height=PLOT_HEIGHT,
+            width=self.plot_width,
+            height=self.plot_height,
             bg="#f7f7f2",
             highlightthickness=0,
         )
         self.canvas.pack()
-        self.update([], [], 0, 0)
+        self.update({}, 0, 0)
 
     def close(self):
         if self.closed:
@@ -100,32 +324,14 @@ class DribbleDashboard:
         self.closed = True
         self.root.destroy()
 
-    def update(self, carry_seconds, distances, episode_count, update_seconds):
+    def update(self, plot_data, episode_count, update_seconds):
         if self.closed:
             return
 
         self.canvas.delete("all")
-        self._draw_plot(
-            x0=PLOT_PADDING,
-            y0=PLOT_PADDING,
-            width=(PLOT_WIDTH - PLOT_PADDING * 3) / 2,
-            height=PLOT_HEIGHT - PLOT_PADDING * 2,
-            values=carry_seconds,
-            title="Carry Time Per Episode (s)",
-            point_color="#2563eb",
-        )
-        self._draw_plot(
-            x0=(PLOT_WIDTH + PLOT_PADDING) / 2,
-            y0=PLOT_PADDING,
-            width=(PLOT_WIDTH - PLOT_PADDING * 3) / 2,
-            height=PLOT_HEIGHT - PLOT_PADDING * 2,
-            values=distances,
-            title="Distance Traveled Per Episode (uu)",
-            point_color="#ea580c",
-        )
         self.canvas.create_text(
             PLOT_PADDING,
-            20,
+            22,
             anchor="w",
             text=(
                 f"Episodes: {episode_count}    "
@@ -134,8 +340,59 @@ class DribbleDashboard:
                 f"Updated: {time.strftime('%H:%M:%S')}"
             ),
             fill="#111827",
-            font=("Helvetica", 14, "bold"),
+            font=HEADER_FONT,
         )
+
+        top_y = 60
+        top_height = min(310, max(235, int(self.plot_height * 0.245)))
+        top_width = (self.plot_width - PLOT_PADDING * 3) / 2
+        self._draw_plot(
+            x0=PLOT_PADDING,
+            y0=top_y,
+            width=top_width,
+            height=top_height,
+            spec=plot_data.get("carry_time", {}),
+            title="Carry Time Per Episode (s)",
+            point_color="#2563eb",
+            x_label_prefix="Episode",
+        )
+        self._draw_plot(
+            x0=PLOT_PADDING * 2 + top_width,
+            y0=top_y,
+            width=top_width,
+            height=top_height,
+            spec=plot_data.get("distance", {}),
+            title="Distance Traveled Per Episode (uu)",
+            point_color="#ea580c",
+            x_label_prefix="Episode",
+        )
+
+        row_gap = 50
+        section_gap = 68
+        row1_y = top_y + top_height + section_gap
+        bottom_width = (self.plot_width - PLOT_PADDING * 4) / 3
+        bottom_total_height = self.plot_height - row1_y - PLOT_PADDING
+        bottom_height = max(150, int((bottom_total_height - row_gap) / 2))
+        row2_y = row1_y + bottom_height + row_gap
+        specs = [
+            ("carry_distance", "Carry Distance While Carrying (uu)", "#0891b2", PLOT_PADDING, row1_y),
+            ("loop_progress", "Loop Progress Per Episode (uu)", "#7c3aed", PLOT_PADDING * 2 + bottom_width, row1_y),
+            ("correct_turn_yaw", "Correct-Turn Yaw Per Episode (rad)", "#0f766e", PLOT_PADDING * 3 + bottom_width * 2, row1_y),
+            ("breadcrumbs_reached", "Breadcrumbs Reached Per Episode", "#b45309", PLOT_PADDING, row2_y),
+            ("wall_approach_penalty", "Wall Approach Penalty Per Episode", "#dc2626", PLOT_PADDING * 2 + bottom_width, row2_y),
+            ("near_wall_carry_seconds", "Near-Wall Carry Time Per Episode (s)", "#4f46e5", PLOT_PADDING * 3 + bottom_width * 2, row2_y),
+        ]
+        for key, title, color, x0, y0 in specs:
+            self._draw_plot(
+                x0=x0,
+                y0=y0,
+                width=bottom_width,
+                height=bottom_height,
+                spec=plot_data.get(key, {}),
+                title=title,
+                point_color=color,
+                x_label_prefix="Tracked Episode",
+            )
 
         try:
             self.root.update_idletasks()
@@ -143,34 +400,41 @@ class DribbleDashboard:
         except tk.TclError:
             self.closed = True
 
-    def _draw_plot(self, x0, y0, width, height, values, title, point_color):
+    def _draw_plot(self, x0, y0, width, height, spec, title, point_color, x_label_prefix):
         x1 = x0 + width
         y1 = y0 + height
         self.canvas.create_rectangle(x0, y0, x1, y1, outline="#9ca3af", width=2)
         self.canvas.create_text(
             x0,
-            y0 - 18,
+            y0 - 16,
             anchor="w",
             text=title,
             fill="#111827",
-            font=("Helvetica", 13, "bold"),
+            font=TITLE_FONT,
         )
 
-        series = values
-        if not series:
+        mean_values = spec.get("mean", [])
+        low_values = spec.get("p05", [])
+        high_values = spec.get("p95", [])
+        markers = spec.get("markers", [])
+        x_end_label = spec.get("x_end_label")
+
+        if not mean_values:
             self.canvas.create_text(
                 x0 + width / 2,
                 y0 + height / 2,
-                text="Waiting for completed episodes...",
+                text="Waiting for data...",
                 fill="#6b7280",
-                font=("Helvetica", 12),
+                font=("Helvetica", 11),
             )
             return
 
-        target_points = max(80, min(MAX_RENDER_POINTS, int(width)))
-        plot_x, plot_y = _compress_plot_series(series, target_points)
-        min_val = float(plot_y.min())
-        max_val = float(plot_y.max())
+        target_points = max(60, min(MAX_RENDER_POINTS, int(width)))
+        plot_x, plot_mean = _compress_plot_series(mean_values, target_points)
+        _, plot_low = _compress_plot_series(low_values, target_points)
+        _, plot_high = _compress_plot_series(high_values, target_points)
+        min_val = float(min(plot_low.min(), plot_mean.min(), plot_high.min()))
+        max_val = float(max(plot_low.max(), plot_mean.max(), plot_high.max()))
         if max_val - min_val < 1e-6:
             max_val = min_val + 1.0
 
@@ -180,40 +444,122 @@ class DribbleDashboard:
             label_val = min_val + frac * (max_val - min_val)
             self.canvas.create_line(x0, y, x1, y, fill="#e5e7eb")
             self.canvas.create_text(
-                x0 - 10,
+                x0 - 8,
                 y,
                 anchor="e",
                 text=f"{label_val:.1f}",
                 fill="#6b7280",
-                font=("Helvetica", 10),
+                font=AXIS_FONT,
             )
+
+        for marker_index, marker in enumerate(markers):
+            if marker["episode"] < 1 or marker["episode"] > len(mean_values):
+                continue
+            marker_x = x0 + ((marker["episode"] - 1) / max(len(mean_values) - 1, 1)) * width
+            marker_color = marker.get("color", "#b91c1c")
+            self.canvas.create_line(marker_x, y0, marker_x, y1, fill=marker_color, width=2, dash=(10, 6))
+
+            if marker_x > x1 - 85:
+                label_x = marker_x - 6
+                anchor = "ne"
+            else:
+                label_x = marker_x + 6
+                anchor = "nw"
+            label_y = y0 + 8 + 18 * (marker_index % 3)
+            text_id = self.canvas.create_text(
+                label_x,
+                label_y,
+                anchor=anchor,
+                text=marker.get("label", "Phase"),
+                fill=marker_color,
+                font=MARKER_FONT,
+            )
+            bbox = self.canvas.bbox(text_id)
+            if bbox is not None:
+                pad = 3
+                rect_id = self.canvas.create_rectangle(
+                    bbox[0] - pad,
+                    bbox[1] - pad,
+                    bbox[2] + pad,
+                    bbox[3] + pad,
+                    fill="#f7f7f2",
+                    outline="",
+                )
+                self.canvas.tag_lower(rect_id, text_id)
 
         self.canvas.create_text(
             x0,
-            y1 + 16,
+            y1 + 14,
             anchor="w",
-            text="Episode 1",
+            text=f"{x_label_prefix} 1",
             fill="#6b7280",
-            font=("Helvetica", 10),
+            font=AXIS_FONT,
         )
+        end_label = len(mean_values) if x_end_label is None else x_end_label
         self.canvas.create_text(
             x1,
-            y1 + 16,
+            y1 + 14,
             anchor="e",
-            text=f"Episode {len(series)}",
+            text=f"{x_label_prefix} {end_label}",
             fill="#6b7280",
-            font=("Helvetica", 10),
+            font=AXIS_FONT,
         )
 
-        rolling_points = []
-        for x_value, value in zip(plot_x, plot_y):
-            x = x0 + (x_value / max(len(series) - 1, 1)) * width
-            y = y1 - ((value - min_val) / (max_val - min_val)) * height
-            rolling_points.extend((x, y))
+        legend_color = _lighten_color(point_color)
+        self._draw_legend(x1, y0 - 16, point_color, legend_color)
 
-        if len(rolling_points) >= 4:
-            self.canvas.create_line(*rolling_points, fill=point_color, width=3, smooth=True)
+        low_points = []
+        high_points = []
+        mean_points = []
+        for x_value, low_value, mean_value, high_value in zip(plot_x, plot_low, plot_mean, plot_high):
+            x = x0 + (x_value / max(len(mean_values) - 1, 1)) * width
+            low_y = y1 - ((low_value - min_val) / (max_val - min_val)) * height
+            high_y = y1 - ((high_value - min_val) / (max_val - min_val)) * height
+            mean_y = y1 - ((mean_value - min_val) / (max_val - min_val)) * height
+            low_points.extend((x, low_y))
+            high_points.extend((x, high_y))
+            mean_points.extend((x, mean_y))
 
+        if len(low_points) >= 4:
+            self.canvas.create_line(*low_points, fill=legend_color, width=2, dash=(6, 6), smooth=True)
+        if len(high_points) >= 4:
+            self.canvas.create_line(*high_points, fill=legend_color, width=2, dash=(6, 6), smooth=True)
+        if len(mean_points) >= 4:
+            self.canvas.create_line(*mean_points, fill=point_color, width=3, smooth=True)
+
+    def _draw_legend(self, x1, title_y, point_color, legend_color):
+        base_y = title_y + 2
+        gap = 52
+
+        self.canvas.create_line(x1 - 165, base_y, x1 - 145, base_y, fill=point_color, width=3)
+        self.canvas.create_text(
+            x1 - 141,
+            base_y,
+            anchor="w",
+            text="mean",
+            fill=point_color,
+            font=LEGEND_FONT,
+        )
+
+        self.canvas.create_line(x1 - 103, base_y, x1 - 83, base_y, fill=legend_color, width=2, dash=(6, 6))
+        self.canvas.create_text(
+            x1 - 79,
+            base_y,
+            anchor="w",
+            text="5th",
+            fill=legend_color,
+            font=LEGEND_FONT,
+        )
+
+        self.canvas.create_line(x1 - 47, base_y, x1 - 27, base_y, fill=legend_color, width=2, dash=(6, 6))
+        self.canvas.create_text(
+            x1 - 23,
+            base_y,
+            anchor="w",
+            text="95th",
+            fill=legend_color,
+            font=LEGEND_FONT,
+        )
 
 
 class DribbleMetricsLogger:
@@ -224,34 +570,116 @@ class DribbleMetricsLogger:
         self.last_dashboard_time = 0.0
 
         METRICS_DIR.mkdir(exist_ok=True)
+        ARTIFACTS_DIR.mkdir(exist_ok=True)
+        RECORD_GIFS_DIR.mkdir(exist_ok=True)
+
         self.carry_seconds, self.distances = _load_metric_history()
         self.carry_rolling = _rolling_average(self.carry_seconds, ROLLING_WINDOW)
+        self.carry_p05 = _rolling_percentile(self.carry_seconds, ROLLING_WINDOW, 5)
+        self.carry_p95 = _rolling_percentile(self.carry_seconds, ROLLING_WINDOW, 95)
         self.distance_rolling = _rolling_average(self.distances, ROLLING_WINDOW)
+        self.distance_p05 = _rolling_percentile(self.distances, ROLLING_WINDOW, 5)
+        self.distance_p95 = _rolling_percentile(self.distances, ROLLING_WINDOW, 95)
+
+        phase4 = _load_phase4_history()
+        self.phase4_episodes = phase4["episodes"]
+        self.carry_distance = phase4["carry_distance"]
+        self.loop_progress = phase4["loop_progress"]
+        self.correct_turn_yaw = phase4["correct_turn_yaw"]
+        self.breadcrumbs_reached = phase4["breadcrumbs_reached"]
+        self.wall_approach_penalty = phase4["wall_approach_penalty"]
+        self.near_wall_carry_seconds = phase4["near_wall_carry_seconds"]
+
+        self.carry_distance_rolling = _rolling_average(self.carry_distance, ROLLING_WINDOW)
+        self.carry_distance_p05 = _rolling_percentile(self.carry_distance, ROLLING_WINDOW, 5)
+        self.carry_distance_p95 = _rolling_percentile(self.carry_distance, ROLLING_WINDOW, 95)
+        self.loop_progress_rolling = _rolling_average(self.loop_progress, ROLLING_WINDOW)
+        self.loop_progress_p05 = _rolling_percentile(self.loop_progress, ROLLING_WINDOW, 5)
+        self.loop_progress_p95 = _rolling_percentile(self.loop_progress, ROLLING_WINDOW, 95)
+        self.correct_turn_yaw_rolling = _rolling_average(self.correct_turn_yaw, ROLLING_WINDOW)
+        self.correct_turn_yaw_p05 = _rolling_percentile(self.correct_turn_yaw, ROLLING_WINDOW, 5)
+        self.correct_turn_yaw_p95 = _rolling_percentile(self.correct_turn_yaw, ROLLING_WINDOW, 95)
+        self.breadcrumbs_reached_rolling = _rolling_average(self.breadcrumbs_reached, ROLLING_WINDOW)
+        self.breadcrumbs_reached_p05 = _rolling_percentile(self.breadcrumbs_reached, ROLLING_WINDOW, 5)
+        self.breadcrumbs_reached_p95 = _rolling_percentile(self.breadcrumbs_reached, ROLLING_WINDOW, 95)
+        self.wall_approach_penalty_rolling = _rolling_average(self.wall_approach_penalty, ROLLING_WINDOW)
+        self.wall_approach_penalty_p05 = _rolling_percentile(self.wall_approach_penalty, ROLLING_WINDOW, 5)
+        self.wall_approach_penalty_p95 = _rolling_percentile(self.wall_approach_penalty, ROLLING_WINDOW, 95)
+        self.near_wall_carry_seconds_rolling = _rolling_average(self.near_wall_carry_seconds, ROLLING_WINDOW)
+        self.near_wall_carry_seconds_p05 = _rolling_percentile(self.near_wall_carry_seconds, ROLLING_WINDOW, 5)
+        self.near_wall_carry_seconds_p95 = _rolling_percentile(self.near_wall_carry_seconds, ROLLING_WINDOW, 95)
+
+        self.markers = _load_markers()
         self.episode_counter = len(self.carry_seconds)
+        self.best_carry_record = max(self.carry_seconds) if self.carry_seconds else 0.0
 
         if not METRICS_CSV.exists():
             with METRICS_CSV.open("w", newline="") as handle:
                 writer = csv.writer(handle)
                 writer.writerow(["episode", "carry_seconds", "distance_traveled_uu"])
 
+        if not PHASE4_METRICS_CSV.exists():
+            with PHASE4_METRICS_CSV.open("w", newline="") as handle:
+                writer = csv.writer(handle)
+                writer.writerow(
+                    [
+                        "episode",
+                        "carry_distance_uu",
+                        "loop_progress_uu",
+                        "correct_turn_yaw_rad",
+                        "breadcrumbs_reached",
+                        "wall_approach_penalty",
+                        "near_wall_carry_seconds",
+                    ]
+                )
+
         self.dashboard = DribbleDashboard()
-        self.dashboard.update(
-            self.carry_rolling,
-            self.distance_rolling,
-            self.episode_counter,
-            self.dashboard_update_seconds,
-        )
+        self.dashboard.update(self._build_plot_data(), self.episode_counter, self.dashboard_update_seconds)
 
     def __getstate__(self):
         state = self.__dict__.copy()
         state["dashboard"] = None
         state["worker_pid"] = None
         state["process_state"] = {}
-        state["carry_seconds"] = []
-        state["distances"] = []
-        state["carry_rolling"] = []
-        state["distance_rolling"] = []
+        for key in (
+            "carry_seconds",
+            "distances",
+            "carry_rolling",
+            "carry_p05",
+            "carry_p95",
+            "distance_rolling",
+            "distance_p05",
+            "distance_p95",
+            "phase4_episodes",
+            "carry_distance",
+            "loop_progress",
+            "correct_turn_yaw",
+            "breadcrumbs_reached",
+            "wall_approach_penalty",
+            "near_wall_carry_seconds",
+            "carry_distance_rolling",
+            "carry_distance_p05",
+            "carry_distance_p95",
+            "loop_progress_rolling",
+            "loop_progress_p05",
+            "loop_progress_p95",
+            "correct_turn_yaw_rolling",
+            "correct_turn_yaw_p05",
+            "correct_turn_yaw_p95",
+            "breadcrumbs_reached_rolling",
+            "breadcrumbs_reached_p05",
+            "breadcrumbs_reached_p95",
+            "wall_approach_penalty_rolling",
+            "wall_approach_penalty_p05",
+            "wall_approach_penalty_p95",
+            "near_wall_carry_seconds_rolling",
+            "near_wall_carry_seconds_p05",
+            "near_wall_carry_seconds_p95",
+            "markers",
+        ):
+            state[key] = []
         state["episode_counter"] = 0
+        state["best_carry_record"] = 0.0
         return state
 
     def __setstate__(self, state):
@@ -274,18 +702,65 @@ class DribbleMetricsLogger:
             self.worker_pid = os.getpid()
 
         if not game_state.cars:
-            return [np.zeros(5, dtype=np.float32)]
+            return [np.zeros(19, dtype=np.float32)]
 
         car = next(iter(game_state.cars.values()))
         _, _, _, carry_quality = get_dribble_alignment(car, game_state.ball.position)
         carrying = 1.0 if carry_quality > CARRY_THRESHOLD else 0.0
+        current_heading = heading_angle(car.physics.forward[:2])
+
+        loop_state = get_current_loop_state()
+        loop_angle = -1.0
+        loop_radius = 0.0
+        turn_direction = 0.0
+        breadcrumbs_reached = 0.0
+        target_x = 0.0
+        target_y = 0.0
+        has_target = 0.0
+        loop_x = 0.0
+        loop_y = 0.0
+        if loop_state is not None:
+            loop_x = float(loop_state.get("loop_x", 0.0))
+            loop_y = float(loop_state.get("loop_y", 0.0))
+            if loop_x > 0.0 and loop_y > 0.0:
+                loop_angle = ellipse_angle(car.physics.position[:2], loop_x, loop_y)
+                loop_radius = 0.5 * (loop_x + loop_y)
+            turn_direction = float(loop_state.get("turn_direction", 0.0))
+            breadcrumbs_reached = float(loop_state.get("breadcrumbs_reached", 0.0))
+            target_xy = loop_state.get("target_xy")
+            if target_xy is not None:
+                target_x = float(target_xy[0])
+                target_y = float(target_xy[1])
+                has_target = 1.0
+
+        wall_approach_penalty = WALL_APPROACH_PENALTY_SCALE * carry_quality * wall_approach_score(
+            car.physics.position[:2],
+            car.physics.forward[:2],
+            car.physics.linear_velocity[:2],
+        )
+        near_wall_flag = 1.0 if carrying > 0.5 and near_wall_warning_score(car.physics.position[:2]) > 0.0 else 0.0
+
         metric = np.array(
             [
                 float(self.worker_pid),
                 float(game_state.tick_count),
                 float(car.physics.position[0]),
                 float(car.physics.position[1]),
+                current_heading,
+                float(game_state.ball.position[0]),
+                float(game_state.ball.position[1]),
                 carrying,
+                loop_angle,
+                loop_radius,
+                turn_direction,
+                breadcrumbs_reached,
+                wall_approach_penalty,
+                near_wall_flag,
+                target_x,
+                target_y,
+                has_target,
+                loop_x,
+                loop_y,
             ],
             dtype=np.float32,
         )
@@ -297,72 +772,290 @@ class DribbleMetricsLogger:
             if not metrics_arrays:
                 continue
             metric = np.asarray(metrics_arrays[0], dtype=np.float32)
-            if metric.size != 5:
+            if metric.size != 19:
                 continue
             self._consume_metric(metric)
 
         if wandb_run is not None and self.carry_seconds:
-            wandb_run.log(
-                {
-                    "Dribble/Latest Carry Seconds": self.carry_seconds[-1],
-                    "Dribble/Latest Distance": self.distances[-1],
-                    "Dribble/Mean Carry Seconds (Last 20)": float(np.mean(self.carry_seconds[-20:])),
-                    "Dribble/Mean Distance (Last 20)": float(np.mean(self.distances[-20:])),
-                    "Cumulative Timesteps": cumulative_timesteps,
-                }
-            )
+            log_data = {
+                "Dribble/Latest Carry Seconds": self.carry_seconds[-1],
+                "Dribble/Latest Distance": self.distances[-1],
+                "Dribble/Mean Carry Seconds (Last 20)": float(np.mean(self.carry_seconds[-20:])),
+                "Dribble/Mean Distance (Last 20)": float(np.mean(self.distances[-20:])),
+                "Cumulative Timesteps": cumulative_timesteps,
+            }
+            if self.carry_distance:
+                log_data.update(
+                    {
+                        "Dribble/Latest Carry Distance": self.carry_distance[-1],
+                        "Dribble/Latest Loop Progress": self.loop_progress[-1],
+                        "Dribble/Latest Correct Turn Yaw": self.correct_turn_yaw[-1],
+                        "Dribble/Latest Breadcrumbs Reached": self.breadcrumbs_reached[-1],
+                        "Dribble/Latest Wall Approach Penalty": self.wall_approach_penalty[-1],
+                        "Dribble/Latest Near-Wall Carry Seconds": self.near_wall_carry_seconds[-1],
+                    }
+                )
+            wandb_run.log(log_data)
 
         now = time.monotonic()
         if now - self.last_dashboard_time >= self.dashboard_update_seconds:
-            self.dashboard.update(
-                self.carry_rolling,
-                self.distance_rolling,
-                self.episode_counter,
-                self.dashboard_update_seconds,
-            )
+            self.dashboard.update(self._build_plot_data(), self.episode_counter, self.dashboard_update_seconds)
             self.last_dashboard_time = now
+
+    def _build_plot_data(self):
+        tracked_count = len(self.carry_distance_rolling)
+        tracked_markers = _project_markers_to_tracked(self.markers, self.phase4_episodes)
+        return {
+            "carry_time": {
+                "mean": self.carry_rolling,
+                "p05": self.carry_p05,
+                "p95": self.carry_p95,
+                "markers": self.markers,
+                "x_end_label": self.episode_counter,
+            },
+            "distance": {
+                "mean": self.distance_rolling,
+                "p05": self.distance_p05,
+                "p95": self.distance_p95,
+                "markers": self.markers,
+                "x_end_label": self.episode_counter,
+            },
+            "carry_distance": {
+                "mean": self.carry_distance_rolling,
+                "p05": self.carry_distance_p05,
+                "p95": self.carry_distance_p95,
+                "markers": tracked_markers,
+                "x_end_label": tracked_count,
+            },
+            "loop_progress": {
+                "mean": self.loop_progress_rolling,
+                "p05": self.loop_progress_p05,
+                "p95": self.loop_progress_p95,
+                "markers": tracked_markers,
+                "x_end_label": tracked_count,
+            },
+            "correct_turn_yaw": {
+                "mean": self.correct_turn_yaw_rolling,
+                "p05": self.correct_turn_yaw_p05,
+                "p95": self.correct_turn_yaw_p95,
+                "markers": tracked_markers,
+                "x_end_label": tracked_count,
+            },
+            "breadcrumbs_reached": {
+                "mean": self.breadcrumbs_reached_rolling,
+                "p05": self.breadcrumbs_reached_p05,
+                "p95": self.breadcrumbs_reached_p95,
+                "markers": tracked_markers,
+                "x_end_label": tracked_count,
+            },
+            "wall_approach_penalty": {
+                "mean": self.wall_approach_penalty_rolling,
+                "p05": self.wall_approach_penalty_p05,
+                "p95": self.wall_approach_penalty_p95,
+                "markers": tracked_markers,
+                "x_end_label": tracked_count,
+            },
+            "near_wall_carry_seconds": {
+                "mean": self.near_wall_carry_seconds_rolling,
+                "p05": self.near_wall_carry_seconds_p05,
+                "p95": self.near_wall_carry_seconds_p95,
+                "markers": tracked_markers,
+                "x_end_label": tracked_count,
+            },
+        }
 
     def _consume_metric(self, metric):
         pid = int(metric[0])
         tick_count = int(metric[1])
         position = metric[2:4].astype(np.float32)
-        carrying = bool(metric[4] > 0.5)
+        current_heading = float(metric[4])
+        ball_position = metric[5:7].astype(np.float32)
+        carrying = bool(metric[7] > 0.5)
+        loop_angle = float(metric[8])
+        loop_radius = float(metric[9])
+        turn_direction = float(metric[10])
+        breadcrumbs_reached = float(metric[11])
+        wall_approach_penalty = float(metric[12])
+        near_wall_flag = bool(metric[13] > 0.5)
+        target_position = metric[14:16].astype(np.float32)
+        has_target = bool(metric[16] > 0.5)
+        loop_x = float(metric[17])
+        loop_y = float(metric[18])
 
         state = self.process_state.get(pid)
         if state is None:
             self.process_state[pid] = {
                 "last_tick": tick_count,
                 "last_pos": position,
+                "last_heading": current_heading,
+                "last_loop_angle": loop_angle if loop_angle >= 0.0 else None,
                 "carry_steps": 1 if carrying else 0,
                 "distance": 0.0,
+                "carry_distance": 0.0,
+                "loop_progress": 0.0,
+                "correct_turn_yaw": 0.0,
+                "breadcrumbs_reached": breadcrumbs_reached,
+                "wall_approach_penalty": wall_approach_penalty,
+                "near_wall_carry_steps": 1 if carrying and near_wall_flag else 0,
+                "frames": [
+                    self._build_episode_frame(
+                        position,
+                        current_heading,
+                        ball_position,
+                        target_position,
+                        has_target,
+                        loop_x,
+                        loop_y,
+                    )
+                ],
             }
             return
 
         if tick_count <= state["last_tick"]:
             self._finalize_episode(state)
+            state["last_tick"] = tick_count
+            state["last_pos"] = position
+            state["last_heading"] = current_heading
+            state["last_loop_angle"] = loop_angle if loop_angle >= 0.0 else None
             state["carry_steps"] = 1 if carrying else 0
             state["distance"] = 0.0
-            state["last_pos"] = position
-            state["last_tick"] = tick_count
+            state["carry_distance"] = 0.0
+            state["loop_progress"] = 0.0
+            state["correct_turn_yaw"] = 0.0
+            state["breadcrumbs_reached"] = breadcrumbs_reached
+            state["wall_approach_penalty"] = wall_approach_penalty
+            state["near_wall_carry_steps"] = 1 if carrying and near_wall_flag else 0
+            state["frames"] = [
+                self._build_episode_frame(
+                    position,
+                    current_heading,
+                    ball_position,
+                    target_position,
+                    has_target,
+                    loop_x,
+                    loop_y,
+                )
+            ]
             return
 
-        state["distance"] += float(np.linalg.norm(position - state["last_pos"]))
+        step_distance = float(np.linalg.norm(position - state["last_pos"]))
+        state["distance"] += step_distance
         state["carry_steps"] += 1 if carrying else 0
+        if carrying:
+            state["carry_distance"] += step_distance
+
+            heading_delta = wrap_angle(current_heading - state["last_heading"])
+            state["correct_turn_yaw"] += max(turn_direction * heading_delta, 0.0)
+
+            if loop_angle >= 0.0 and state["last_loop_angle"] is not None and loop_radius > 0.0:
+                loop_delta = wrap_angle(loop_angle - state["last_loop_angle"])
+                state["loop_progress"] += max(turn_direction * loop_delta, 0.0) * loop_radius
+
+            if near_wall_flag:
+                state["near_wall_carry_steps"] += 1
+
+        state["breadcrumbs_reached"] = max(state["breadcrumbs_reached"], breadcrumbs_reached)
+        state["wall_approach_penalty"] += wall_approach_penalty
         state["last_pos"] = position
         state["last_tick"] = tick_count
+        state["last_heading"] = current_heading
+        state["last_loop_angle"] = loop_angle if loop_angle >= 0.0 else state["last_loop_angle"]
+        state["frames"].append(
+            self._build_episode_frame(
+                position,
+                current_heading,
+                ball_position,
+                target_position,
+                has_target,
+                loop_x,
+                loop_y,
+            )
+        )
 
     def _finalize_episode(self, state):
         carry_seconds = state["carry_steps"] / DECISIONS_PER_SECOND
         distance = state["distance"]
+        carry_distance = state["carry_distance"]
+        loop_progress = state["loop_progress"]
+        correct_turn_yaw = state["correct_turn_yaw"]
+        breadcrumbs_reached = state["breadcrumbs_reached"]
+        wall_approach_penalty = state["wall_approach_penalty"]
+        near_wall_carry_seconds = state["near_wall_carry_steps"] / DECISIONS_PER_SECOND
         self.episode_counter += 1
-        self.carry_seconds.append(carry_seconds)
-        self.distances.append(distance)
-        self.carry_rolling.append(float(np.mean(self.carry_seconds[-ROLLING_WINDOW:])))
-        self.distance_rolling.append(float(np.mean(self.distances[-ROLLING_WINDOW:])))
+
+        _append_rolling_stats(self.carry_seconds, self.carry_rolling, self.carry_p05, self.carry_p95, carry_seconds)
+        _append_rolling_stats(self.distances, self.distance_rolling, self.distance_p05, self.distance_p95, distance)
+
+        self.phase4_episodes.append(self.episode_counter)
+        _append_rolling_stats(
+            self.carry_distance,
+            self.carry_distance_rolling,
+            self.carry_distance_p05,
+            self.carry_distance_p95,
+            carry_distance,
+        )
+        _append_rolling_stats(
+            self.loop_progress,
+            self.loop_progress_rolling,
+            self.loop_progress_p05,
+            self.loop_progress_p95,
+            loop_progress,
+        )
+        _append_rolling_stats(
+            self.correct_turn_yaw,
+            self.correct_turn_yaw_rolling,
+            self.correct_turn_yaw_p05,
+            self.correct_turn_yaw_p95,
+            correct_turn_yaw,
+        )
+        _append_rolling_stats(
+            self.breadcrumbs_reached,
+            self.breadcrumbs_reached_rolling,
+            self.breadcrumbs_reached_p05,
+            self.breadcrumbs_reached_p95,
+            breadcrumbs_reached,
+        )
+        _append_rolling_stats(
+            self.wall_approach_penalty,
+            self.wall_approach_penalty_rolling,
+            self.wall_approach_penalty_p05,
+            self.wall_approach_penalty_p95,
+            wall_approach_penalty,
+        )
+        _append_rolling_stats(
+            self.near_wall_carry_seconds,
+            self.near_wall_carry_seconds_rolling,
+            self.near_wall_carry_seconds_p05,
+            self.near_wall_carry_seconds_p95,
+            near_wall_carry_seconds,
+        )
 
         with METRICS_CSV.open("a", newline="") as handle:
             writer = csv.writer(handle)
             writer.writerow([self.episode_counter, carry_seconds, distance])
+
+        with PHASE4_METRICS_CSV.open("a", newline="") as handle:
+            writer = csv.writer(handle)
+            writer.writerow(
+                [
+                    self.episode_counter,
+                    carry_distance,
+                    loop_progress,
+                    correct_turn_yaw,
+                    breadcrumbs_reached,
+                    wall_approach_penalty,
+                    near_wall_carry_seconds,
+                ]
+            )
+
+        if carry_seconds > self.best_carry_record + 1e-6:
+            self.best_carry_record = carry_seconds
+            self._save_record_breaker_gif(
+                episode=self.episode_counter,
+                carry_seconds=carry_seconds,
+                breadcrumbs_reached=breadcrumbs_reached,
+                frames=state.get("frames", []),
+            )
 
     @staticmethod
     def _deserialize(serialized_metrics):
@@ -381,3 +1074,51 @@ class DribbleMetricsLogger:
             metrics_arrays.append(metric)
             i = i + n_shape + n_values_in_metric
         return metrics_arrays
+
+    @staticmethod
+    def _build_episode_frame(position, current_heading, ball_position, target_position, has_target, loop_x, loop_y):
+        return {
+            "car_x": float(position[0]),
+            "car_y": float(position[1]),
+            "heading": float(current_heading),
+            "ball_x": float(ball_position[0]),
+            "ball_y": float(ball_position[1]),
+            "target_x": float(target_position[0]),
+            "target_y": float(target_position[1]),
+            "has_target": bool(has_target),
+            "loop_x": float(loop_x),
+            "loop_y": float(loop_y),
+        }
+
+    def _save_record_breaker_gif(self, episode, carry_seconds, breadcrumbs_reached, frames):
+        if not frames:
+            return
+
+        sampled_frames = frames[::RECORD_GIF_FRAME_STRIDE]
+        if sampled_frames[-1] is not frames[-1]:
+            sampled_frames.append(frames[-1])
+
+        images = []
+        for index, frame in enumerate(sampled_frames):
+            images.append(
+                _draw_record_frame(
+                    frame,
+                    (
+                        f"Record attempt | episode {episode} | "
+                        f"carry {carry_seconds:.2f}s | breadcrumbs {int(breadcrumbs_reached)} | "
+                        f"frame {index + 1}/{len(sampled_frames)}"
+                    ),
+                )
+            )
+
+        filename = f"record_ep{episode:07d}_{carry_seconds:.2f}s.gif"
+        output_path = RECORD_GIFS_DIR / filename
+        images[0].save(
+            output_path,
+            save_all=True,
+            append_images=images[1:],
+            duration=RECORD_GIF_FRAME_DURATION_MS,
+            loop=0,
+            optimize=False,
+        )
+        print(f"Saved record breaker GIF: {output_path}")

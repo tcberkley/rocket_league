@@ -37,8 +37,11 @@ main.py           Entry point; defines standard/dribble env factories, watch mod
 rewards.py        Custom VelocityBallToGoalReward (v2 API); TouchReward is from rlgym built-ins
 learner.py        run_learner(env_create_func): configures and starts rlgym_ppo.Learner
 dribble.py        Dribble scenario mutator, reward shaping, and termination logic
-dribble_metrics.py Live dribble dashboard + CSV episode metrics logger
+dribble_metrics.py Live dribble dashboard, CSV episode metrics logger, minimap, and record-breaker GIFs
+record_rollout.py  Record rollout GIFs with loop lane and waypoint overlays
 models/           Saved PPO checkpoints (gitignored)
+metrics/          Episode CSV logs and marker annotations
+artifacts/        Generated GIFs (rollouts and record-breakers)
 ```
 
 ### Data flow
@@ -64,16 +67,23 @@ models/           Saved PPO checkpoints (gitignored)
 ## Dribble Scenario
 
 - `main.py --scenario dribble` trains a single-car carry task instead of standard 1v1
-- `DribbleStartMutator` in `dribble.py` now uses randomized stable starts: random field position, random yaw, small hood-placement noise for the ball, and randomized initial speed
-- Goal mouths are treated as failure zones in dribble mode, so driving into the goal ends the episode
-- The dribble reward combines carry quality, forward movement while carrying, and a small anti-stall mechanism
+- `DribbleStartMutator` spawns the car on an elliptical loop lane with the ball on its hood, tangent-aligned to the lane direction
+- A **breadcrumb waypoint** system chains targets along the loop; reaching one spawns the next, rewarding continuous turning while carrying
+- **Curriculum difficulty** ramps from easy (wide loops, gentle turns) through medium to hard (tighter loops, more waypoints) based on episode count (`EASY_CURRICULUM_EPISODES`, `MIXED_CURRICULUM_EPISODES`)
+- Wall, corner, and wall-approach penalties discourage drifting to field edges during carries
+- Goal mouths are still treated as failure zones — driving into the goal ends the episode
+- The dribble reward combines carry quality, forward movement, loop progress (yaw delta + ellipse arc), tangent alignment, breadcrumb approach, and the anti-stall mechanism
+- Global state accessors `get_current_loop_state()` / `get_current_turn_target_xy()` expose loop info for visualization
 
 ## Dashboard Metrics
 
 - `--dashboard` enables the local Tk dashboard during dribble training
 - `--dashboard-update-seconds` controls refresh cadence; the current default is `1.0`
-- The dashboard loads history from `metrics/dribble_episode_metrics.csv`
-- Charts display 50-episode rolling averages compressed into at most 480 plotted bins so long runs stay readable
+- The dashboard loads history from `metrics/dribble_episode_metrics.csv`; phase 4 loop metrics go to `metrics/dribble_phase4_metrics.csv`
+- Charts display 50-episode rolling averages with 5th/95th percentile bands, compressed into at most 420 plotted bins
+- Dashboard includes a live field minimap showing car position, ball, loop lane ellipse, and current waypoint
+- Record-breaking episodes automatically generate animated GIF replays saved to `artifacts/record_breakers/`
+- Annotation markers (stored in `metrics/dribble_markers.json`) can be placed on charts to mark training milestones
 - The plotted `distance_traveled_uu` metric is episode path length in the ground plane (`x/y` step-to-step distance), not straight-line displacement from spawn
 
 ## macOS M-Series Notes

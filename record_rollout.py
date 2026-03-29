@@ -5,6 +5,7 @@ import numpy as np
 import torch
 from PIL import Image, ImageDraw
 
+from dribble import get_current_loop_state, get_current_turn_target_xy
 from learner import POLICY_LAYER_SIZES, prepare_runtime_locale, resolve_checkpoint_folder
 from main import get_env_builder
 
@@ -44,7 +45,7 @@ def _rotated_triangle(center_x, center_y, angle, length=34, width=22):
     return out
 
 
-def draw_frame(state, title):
+def draw_frame(state, title, waypoint_xy=None, loop_state=None):
     from rlgym.rocket_league import common_values
 
     image = Image.new("RGB", (WIDTH, HEIGHT), "#135d36")
@@ -70,6 +71,21 @@ def draw_frame(state, title):
 
     ball_x, ball_y = _to_canvas(state.ball.position[:2])
     draw.ellipse((ball_x - 10, ball_y - 10, ball_x + 10, ball_y + 10), fill="#f8fafc")
+
+    if loop_state is not None:
+        loop_x = float(loop_state.get("loop_x", 0.0))
+        loop_y = float(loop_state.get("loop_y", 0.0))
+        if loop_x > 0.0 and loop_y > 0.0:
+            lane_left, lane_top = _to_canvas((-loop_x, loop_y))
+            lane_right, lane_bottom = _to_canvas((loop_x, -loop_y))
+            draw.ellipse((lane_left, lane_top, lane_right, lane_bottom), outline="#f59e0b", width=3)
+
+    if waypoint_xy is not None:
+        wp_x, wp_y = _to_canvas(waypoint_xy)
+        draw.ellipse((wp_x - 16, wp_y - 16, wp_x + 16, wp_y + 16), outline="#ff4fd8", width=4)
+        draw.line((wp_x - 20, wp_y, wp_x + 20, wp_y), fill="#ff4fd8", width=3)
+        draw.line((wp_x, wp_y - 20, wp_x, wp_y + 20), fill="#ff4fd8", width=3)
+        draw.text((wp_x + 14, wp_y - 28), "WP", fill="#ff4fd8")
 
     for idx, car in enumerate(state.cars.values(), start=1):
         x, y = _to_canvas(car.physics.position[:2])
@@ -111,17 +127,30 @@ def record_rollout(scenario, checkpoint, max_steps, output_path):
     frames = []
     observations = env.reset()
     total_reward = 0.0
-    frames.append(draw_frame(env.rlgym_env.state, f"{scenario.title()} rollout | step 0 | reward 0.00"))
+    waypoint_xy = get_current_turn_target_xy() if scenario == "dribble" else None
+    loop_state = get_current_loop_state() if scenario == "dribble" else None
+    frames.append(
+        draw_frame(
+            env.rlgym_env.state,
+            f"{scenario.title()} rollout | step 0 | reward 0.00",
+            waypoint_xy=waypoint_xy,
+            loop_state=loop_state,
+        )
+    )
 
     try:
         for step in range(1, max_steps + 1):
             actions = select_actions(policy, observations)
             observations, rewards, terminated, truncated, info = env.step(actions)
             total_reward += float(np.sum(rewards))
+            waypoint_xy = get_current_turn_target_xy() if scenario == "dribble" else None
+            loop_state = get_current_loop_state() if scenario == "dribble" else None
             frames.append(
                 draw_frame(
                     info["state"],
                     f"{scenario.title()} rollout | step {step} | total reward {total_reward:.2f}",
+                    waypoint_xy=waypoint_xy,
+                    loop_state=loop_state,
                 )
             )
             if terminated or truncated:
