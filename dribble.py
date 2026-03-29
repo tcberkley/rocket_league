@@ -37,6 +37,7 @@ BALL_UP_OFFSET = 141.0
 
 # Breadcrumb types and their arc parameters: (arc_step_min, arc_step_max, arc_step_mid, min_distance, max_distance)
 _BREADCRUMB_ARC_PARAMS = {
+    "first":    (0.01, 0.12, 0.06, 350.0,  750.0),   # first crumb: close and nearly straight ahead
     "gentle":   (0.12, 0.25, 0.19, 800.0,  1600.0),
     "sharp":    (0.50, 0.85, 0.68, 1200.0, 2800.0),
     "straight": (0.02, 0.08, 0.05, 600.0,  1400.0),
@@ -45,6 +46,7 @@ _BREADCRUMB_ARC_PARAMS = {
 
 CURRENT_TURN_TARGET_XY = None
 CURRENT_LOOP_STATE = None
+REACHED_BREADCRUMB_POSITIONS: List[np.ndarray] = []
 
 
 class DribbleStartMutator(StateMutator[GameState]):
@@ -59,6 +61,7 @@ class DribbleStartMutator(StateMutator[GameState]):
     def apply(self, state: GameState, shared_info: Dict[str, Any]) -> None:
         self.episode_counter += 1
 
+        reset_reached_breadcrumb_positions()
         difficulty = sample_waypoint_difficulty(self.episode_counter, self.rng)
         lane_scale = sample_lane_scale(difficulty, self.rng)
         turn_direction = 1.0 if self.episode_counter % 2 == 1 else -1.0
@@ -75,7 +78,6 @@ class DribbleStartMutator(StateMutator[GameState]):
         up = np.array([0.0, 0.0, 1.0], dtype=np.float32)
         car_speed = float(self.rng.uniform(base_profile["speed_min"], base_profile["speed_max"]))
 
-        initial_crumb_type = sample_breadcrumb_type(difficulty, 0, self.rng)
         target_xy, target_angle, profile = build_turn_target_xy(
             spawn_xy,
             forward[:2],
@@ -85,7 +87,7 @@ class DribbleStartMutator(StateMutator[GameState]):
             difficulty=difficulty,
             lane_scale=lane_scale,
             current_target_angle=spawn_angle,
-            breadcrumb_type=initial_crumb_type,
+            breadcrumb_type="first",
         )
 
         for index, car in enumerate(state.cars.values()):
@@ -270,6 +272,7 @@ class DribbleCarryReward(RewardFunction[AgentID, GameState, float]):
 
         if target_distance <= BREADCRUMB_REACHED_DISTANCE:
             reward += breadcrumb_success_bonus(difficulty)
+            append_reached_breadcrumb_position(car_pos.copy())
             breadcrumbs_reached += 1
 
             # Sample type for the next breadcrumb (may include "flip")
@@ -394,7 +397,10 @@ def build_turn_target_xy(
             abs(float(target_xy[0])) / max(profile["safe_x"], 1.0)
             + abs(float(target_xy[1])) / max(profile["safe_y"], 1.0)
         )
-        score = 1.3 * forward_score + 0.9 * tangent_score + 0.25 * center_score
+        if breadcrumb_type == "first":
+            score = 2.8 * forward_score + 0.4 * tangent_score + 0.4 * center_score
+        else:
+            score = 1.3 * forward_score + 0.9 * tangent_score + 0.25 * center_score
         if score > best_score:
             best_score = score
             best_target = target_xy
@@ -419,24 +425,33 @@ def build_turn_target_xy(
 
 
 def sample_breadcrumb_type(difficulty: str, breadcrumbs_reached: int, rng) -> str:
-    """Sample a breadcrumb type for the next waypoint. Flips are gated by breadcrumbs_reached."""
-    if difficulty == "easy":
-        weights = [0.55, 0.05, 0.35, 0.05]
-    elif difficulty == "hard":
-        weights = [0.20, 0.30, 0.15, 0.35]
-    else:  # medium
-        weights = [0.30, 0.20, 0.20, 0.30]
-    flip_min = 3
+    """Sample a breadcrumb type for the next waypoint.
 
+    Early in the episode (low breadcrumbs_reached) weights are biased toward
+    gentle/straight regardless of curriculum difficulty, then interpolate to
+    the full difficulty weights over the first ~7 breadcrumbs.
+    Flips are gated to breadcrumbs_reached >= 3.
+    """
+    # [gentle, sharp, straight, flip]
+    early_weights = np.array([0.55, 0.02, 0.43, 0.0], dtype=np.float64)
+    if difficulty == "easy":
+        full_weights = np.array([0.55, 0.05, 0.35, 0.05], dtype=np.float64)
+    elif difficulty == "hard":
+        full_weights = np.array([0.20, 0.30, 0.15, 0.35], dtype=np.float64)
+    else:  # medium
+        full_weights = np.array([0.30, 0.20, 0.20, 0.30], dtype=np.float64)
+
+    # t=0 at breadcrumb 1, t=1 at breadcrumb 7+
+    t = float(np.clip((breadcrumbs_reached - 1) / 6.0, 0.0, 1.0))
+    weights = (1.0 - t) * early_weights + t * full_weights
+
+    flip_min = 3
     if breadcrumbs_reached < flip_min:
-        # Redistribute flip weight to gentle
-        weights = list(weights)
         weights[0] += weights[3]
         weights[3] = 0.0
 
-    weights_arr = np.asarray(weights, dtype=np.float64)
-    weights_arr /= weights_arr.sum()
-    return str(rng.choice(["gentle", "sharp", "straight", "flip"], p=weights_arr))
+    weights /= weights.sum()
+    return str(rng.choice(["gentle", "sharp", "straight", "flip"], p=weights))
 
 
 def breadcrumb_type_arc_params(breadcrumb_type: str):
@@ -581,6 +596,19 @@ def breadcrumb_segment_is_safe(car_pos_xy, target_xy, safe_x: float, safe_y: flo
         return True
     outward = safe_normalize(outward)
     return float(np.dot(target_dir, outward)) < 0.55
+
+
+def reset_reached_breadcrumb_positions():
+    global REACHED_BREADCRUMB_POSITIONS
+    REACHED_BREADCRUMB_POSITIONS = []
+
+
+def append_reached_breadcrumb_position(pos_xy: np.ndarray):
+    REACHED_BREADCRUMB_POSITIONS.append(np.asarray(pos_xy, dtype=np.float32).copy())
+
+
+def get_reached_breadcrumb_positions() -> List[np.ndarray]:
+    return [p.copy() for p in REACHED_BREADCRUMB_POSITIONS]
 
 
 def set_current_turn_target_xy(turn_target_xy):

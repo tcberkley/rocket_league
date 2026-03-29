@@ -5,7 +5,7 @@ import numpy as np
 import torch
 from PIL import Image, ImageDraw
 
-from dribble import get_current_loop_state, get_current_turn_target_xy
+from dribble import get_current_loop_state, get_current_turn_target_xy, get_reached_breadcrumb_positions
 from learner import POLICY_LAYER_SIZES, prepare_runtime_locale, resolve_checkpoint_folder
 from main import get_env_builder
 
@@ -45,7 +45,7 @@ def _rotated_triangle(center_x, center_y, angle, length=34, width=22):
     return out
 
 
-def draw_frame(state, title, waypoint_xy=None, loop_state=None):
+def draw_frame(state, title, waypoint_xy=None, loop_state=None, reached_positions=None):
     from rlgym.rocket_league import common_values
 
     image = Image.new("RGB", (WIDTH, HEIGHT), "#135d36")
@@ -87,6 +87,13 @@ def draw_frame(state, title, waypoint_xy=None, loop_state=None):
         draw.line((wp_x, wp_y - 20, wp_x, wp_y + 20), fill="#ff4fd8", width=3)
         draw.text((wp_x + 14, wp_y - 28), "WP", fill="#ff4fd8")
 
+    if reached_positions:
+        for pos in reached_positions:
+            gx, gy = _to_canvas(pos[:2])
+            draw.ellipse((gx - 9, gy - 9, gx + 9, gy + 9), fill="#4ade80", outline="#166534", width=2)
+
+    n_reached = len(reached_positions) if reached_positions else 0
+
     for idx, car in enumerate(state.cars.values(), start=1):
         x, y = _to_canvas(car.physics.position[:2])
         forward = car.physics.rotation_mtx[:, 0]
@@ -94,6 +101,8 @@ def draw_frame(state, title, waypoint_xy=None, loop_state=None):
         color = "#55a4ff" if car.is_blue else "#ff9a3d"
         draw.polygon(_rotated_triangle(x, y, angle), fill=color, outline="#0f172a")
         draw.text((x + 10, y - 10), f"{'B' if car.is_blue else 'O'}{idx}", fill="#f8fafc")
+        if n_reached > 0:
+            draw.text((x - 6, y - 34), str(n_reached), fill="#4ade80")
 
     draw.text((16, 16), title, fill="#f8fafc")
     return image
@@ -129,12 +138,14 @@ def record_rollout(scenario, checkpoint, max_steps, output_path):
     total_reward = 0.0
     waypoint_xy = get_current_turn_target_xy() if scenario == "dribble" else None
     loop_state = get_current_loop_state() if scenario == "dribble" else None
+    reached = get_reached_breadcrumb_positions() if scenario == "dribble" else None
     frames.append(
         draw_frame(
             env.rlgym_env.state,
             f"{scenario.title()} rollout | step 0 | reward 0.00",
             waypoint_xy=waypoint_xy,
             loop_state=loop_state,
+            reached_positions=reached,
         )
     )
 
@@ -145,12 +156,14 @@ def record_rollout(scenario, checkpoint, max_steps, output_path):
             total_reward += float(np.sum(rewards))
             waypoint_xy = get_current_turn_target_xy() if scenario == "dribble" else None
             loop_state = get_current_loop_state() if scenario == "dribble" else None
+            reached = get_reached_breadcrumb_positions() if scenario == "dribble" else None
             frames.append(
                 draw_frame(
                     info["state"],
                     f"{scenario.title()} rollout | step {step} | total reward {total_reward:.2f}",
                     waypoint_xy=waypoint_xy,
                     loop_state=loop_state,
+                    reached_positions=reached,
                 )
             )
             if terminated or truncated:

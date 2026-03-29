@@ -14,7 +14,8 @@ CAR_WIDTH = 20
 
 
 class SandboxViewer:
-    def __init__(self):
+    def __init__(self, scenario="standard"):
+        self.scenario = scenario
         self.root = tk.Tk()
         self.root.title("Rocket League Sandbox")
         self.root.protocol("WM_DELETE_WINDOW", self.close)
@@ -40,6 +41,7 @@ class SandboxViewer:
             text="",
         )
         self.car_items = {}
+        self._dribble_overlay_items = []
 
     def close(self):
         if not self.is_open:
@@ -51,6 +53,9 @@ class SandboxViewer:
     def update(self, state, episode, step_count):
         if not self.is_open:
             return False
+
+        if self.scenario == "dribble":
+            self._update_dribble_overlay(state)
 
         self._draw_ball(state.ball.position)
         active_ids = set()
@@ -75,6 +80,67 @@ class SandboxViewer:
             self.is_open = False
 
         return self.is_open
+
+    def _update_dribble_overlay(self, state):
+        from dribble import get_current_loop_state, get_reached_breadcrumb_positions
+
+        # Clear previous overlay items
+        for item_id in self._dribble_overlay_items:
+            self.canvas.delete(item_id)
+        self._dribble_overlay_items = []
+
+        loop_state = get_current_loop_state()
+        reached = get_reached_breadcrumb_positions()
+
+        # Loop lane ellipse
+        if loop_state is not None:
+            loop_x = float(loop_state.get("loop_x", 0.0))
+            loop_y = float(loop_state.get("loop_y", 0.0))
+            if loop_x > 0.0 and loop_y > 0.0:
+                lane_left, lane_top = self._to_canvas((-loop_x, loop_y))
+                lane_right, lane_bottom = self._to_canvas((loop_x, -loop_y))
+                self._dribble_overlay_items.append(
+                    self.canvas.create_oval(
+                        lane_left, lane_top, lane_right, lane_bottom,
+                        outline="#f59e0b", width=3,
+                    )
+                )
+
+            # Current waypoint marker (pink crosshair)
+            target_xy = loop_state.get("target_xy")
+            if target_xy is not None:
+                wx, wy = self._to_canvas(target_xy)
+                r = 14
+                self._dribble_overlay_items.append(
+                    self.canvas.create_oval(wx - r, wy - r, wx + r, wy + r, outline="#ff4fd8", width=3)
+                )
+                self._dribble_overlay_items.append(
+                    self.canvas.create_line(wx - 18, wy, wx + 18, wy, fill="#ff4fd8", width=2)
+                )
+                self._dribble_overlay_items.append(
+                    self.canvas.create_line(wx, wy - 18, wx, wy + 18, fill="#ff4fd8", width=2)
+                )
+
+        # Reached breadcrumb dots (green)
+        for pos in reached:
+            gx, gy = self._to_canvas(pos[:2])
+            r = 8
+            self._dribble_overlay_items.append(
+                self.canvas.create_oval(gx - r, gy - r, gx + r, gy + r, fill="#4ade80", outline="#166534", width=2)
+            )
+
+        # Breadcrumb count above each car
+        n_reached = len(reached)
+        for car in state.cars.values():
+            cx, cy = self._to_canvas(car.physics.position[:2])
+            self._dribble_overlay_items.append(
+                self.canvas.create_text(
+                    cx, cy - 36,
+                    text=str(n_reached),
+                    fill="#4ade80",
+                    font=("Helvetica", 13, "bold"),
+                )
+            )
 
     def _draw_field(self):
         left, top = self._to_canvas((-FIELD_HALF_WIDTH, FIELD_HALF_LENGTH))

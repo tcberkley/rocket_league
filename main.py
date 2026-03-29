@@ -248,7 +248,7 @@ def watch_checkpoint(
     if renderer == "sandbox":
         from sandbox import SandboxViewer
 
-        viewer = SandboxViewer()
+        viewer = SandboxViewer(scenario=scenario)
 
     try:
         for episode in range(1, episodes + 1):
