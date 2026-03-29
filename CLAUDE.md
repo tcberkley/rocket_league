@@ -67,14 +67,28 @@ artifacts/        Generated GIFs (rollouts and record-breakers)
 ## Dribble Scenario
 
 - `main.py --scenario dribble` trains a single-car carry task instead of standard 1v1
-- `DribbleStartMutator` spawns the car at a random field position with the ball on its hood
+- `DribbleStartMutator` spawns the car at a random ellipse position with the ball on its hood
 - **Termination**: ball touching ground (`ball_pos[2] < 100.0`), or car/ball entering a goal mouth
 - **Reward** (5 components): carry quality (always), breadcrumb approach (while carrying), breadcrumb success bonus (1.26–1.68 by difficulty), wall/corner/approach penalties, terminal penalty (-1.0 on drop)
-- A **breadcrumb waypoint** system chains targets; each success samples the next breadcrumb type from `("gentle", "sharp", "straight", "flip")` with curriculum-weighted probabilities
-- **Breadcrumb types** by arc geometry: gentle (wide curve), sharp (tight turn), straight (nearly ahead), flip (wide curve + negate turn direction)
-- **Direction flips**: when a `"flip"` breadcrumb is reached, `turn_direction` in `shared_info` is negated so the bot must learn CW↔CCW transitions mid-episode; gated to require 3+ breadcrumbs reached regardless of difficulty
-- **Curriculum difficulty** ramps from easy → medium → hard based on episode count; weights for sharp/flip breadcrumbs increase with difficulty
-- Global state accessor `get_current_loop_state()` exposes loop info for visualization
+
+### Two-Phase Breadcrumb System
+
+Each episode has two phases:
+
+**Phase A — Ellipse loop (breadcrumbs 1–5):** Deterministic type schedule teaches turning in progressively tighter arcs. Total arc ≈ 2π (full loop).
+
+| Crumb | Type | Arc (rad) | Distance (uu) | Purpose |
+|-------|------|-----------|---------------|---------|
+| 1 | `first` | 0.01–0.12 | 350–750 | Close, straight ahead |
+| 2 | `moderate` | 0.80–1.20 | 1800–3200 | Moderate turn |
+| 3 | `hard_turn` | 1.10–1.60 | 2200–3800 | Sharp turn |
+| 4 | `hard_turn` | 1.10–1.60 | 2200–3800 | Sharp turn |
+| 5 | `closing` | 1.80–2.80 | 2000–4500 | Large arc to close the loop |
+
+**Phase B — Random field (breadcrumb 6+):** After completing the loop, waypoints are sampled randomly across the field (`RANDOM_FIELD_SAFE_X/Y` margins), 1500–4000 uu from the car. The loop lane ellipse is hidden in the visualizer when phase B begins.
+
+- **Curriculum difficulty** ramps from easy → medium → hard based on episode count (affects spawn speed, ellipse size, and loop lane margins)
+- Global state accessor `get_current_loop_state()` exposes loop info for visualization; `loop_x=0/loop_y=0` signals Phase B to renderers
 
 ## Dashboard Metrics
 

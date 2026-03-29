@@ -35,13 +35,27 @@ GOAL_MOUTH_Y_LIMIT = common_values.BACK_WALL_Y - 120.0
 BALL_FORWARD_OFFSET = 35.0
 BALL_UP_OFFSET = 141.0
 
+# Phase A: first N breadcrumbs follow the ellipse loop; after that, random field targets
+LOOP_BREADCRUMB_COUNT = 5
+
+# Phase B: random field waypoints (crumbs 6+)
+RANDOM_FIELD_SAFE_X = common_values.SIDE_WALL_X - 1000.0
+RANDOM_FIELD_SAFE_Y = common_values.BACK_WALL_Y - 1400.0
+RANDOM_TARGET_MIN_DISTANCE = 1500.0
+RANDOM_TARGET_MAX_DISTANCE = 4000.0
+RANDOM_TARGET_MAX_ATTEMPTS = 30
+
 # Breadcrumb types and their arc parameters: (arc_step_min, arc_step_max, arc_step_mid, min_distance, max_distance)
+# Loop-phase types cover ~2π total: first(0.06) + moderate(1.0) + hard_turn(1.35) + hard_turn(1.35) + closing(2.30) ≈ 6.06
 _BREADCRUMB_ARC_PARAMS = {
-    "first":    (0.01, 0.12, 0.06, 350.0,  750.0),   # first crumb: close and nearly straight ahead
-    "gentle":   (0.12, 0.25, 0.19, 800.0,  1600.0),
-    "sharp":    (0.50, 0.85, 0.68, 1200.0, 2800.0),
-    "straight": (0.02, 0.08, 0.05, 600.0,  1400.0),
-    "flip":     (0.12, 0.25, 0.19, 800.0,  1600.0),  # same arc as gentle, but direction flips
+    "first":     (0.01, 0.12, 0.06,  350.0,  750.0),   # crumb 1: close, nearly straight ahead
+    "moderate":  (0.80, 1.20, 1.00, 1800.0, 3200.0),   # crumb 2: moderate turn
+    "hard_turn": (1.10, 1.60, 1.35, 2200.0, 3800.0),   # crumbs 3-4: sharp turns
+    "closing":   (1.80, 2.80, 2.30, 2000.0, 4500.0),   # crumb 5: large arc to close the loop
+    "gentle":    (0.12, 0.25, 0.19,  800.0, 1600.0),   # legacy
+    "sharp":     (0.50, 0.85, 0.68, 1200.0, 2800.0),   # legacy
+    "straight":  (0.02, 0.08, 0.05,  600.0, 1400.0),   # legacy
+    "flip":      (0.12, 0.25, 0.19,  800.0, 1600.0),   # legacy
 }
 
 CURRENT_TURN_TARGET_XY = None
@@ -274,38 +288,29 @@ class DribbleCarryReward(RewardFunction[AgentID, GameState, float]):
             reward += breadcrumb_success_bonus(difficulty)
             append_reached_breadcrumb_position(car_pos.copy())
             breadcrumbs_reached += 1
-
-            # Sample type for the next breadcrumb (may include "flip")
-            next_type = sample_breadcrumb_type(difficulty, breadcrumbs_reached, self.rng)
             direction_flips = int(shared_info.get("dribble_direction_flips", 0))
-
-            if next_type == "flip":
-                turn_direction = -turn_direction
-                direction_flips += 1
-                shared_info["dribble_turn_direction"] = turn_direction
-                shared_info["dribble_direction_flips"] = direction_flips
-
             next_waypoint_index = int(shared_info.get("dribble_waypoint_index", 0)) + 1
-            next_target_xy, next_target_angle, next_profile = build_turn_target_xy(
-                car_pos,
-                car.physics.forward[:2],
-                car.physics.right[:2],
-                turn_direction,
-                self.rng,
-                difficulty=difficulty,
-                lane_scale=lane_scale,
-                current_target_angle=float(shared_info.get("dribble_loop_target_angle", 0.0)),
-                breadcrumb_type=next_type,
-            )
 
-            shared_info["dribble_turn_target_xy"] = next_target_xy
-            shared_info["dribble_waypoint_index"] = next_waypoint_index
-            shared_info["dribble_loop_profile"] = next_profile
-            shared_info["dribble_loop_target_angle"] = next_target_angle
-            shared_info["dribble_breadcrumbs_reached"] = breadcrumbs_reached
-
-            set_current_loop_state(
-                {
+            if breadcrumbs_reached < LOOP_BREADCRUMB_COUNT:
+                # Phase A: still on the ellipse loop
+                next_type = breadcrumb_type_for_index(breadcrumbs_reached)
+                next_target_xy, next_target_angle, next_profile = build_turn_target_xy(
+                    car_pos,
+                    car.physics.forward[:2],
+                    car.physics.right[:2],
+                    turn_direction,
+                    self.rng,
+                    difficulty=difficulty,
+                    lane_scale=lane_scale,
+                    current_target_angle=float(shared_info.get("dribble_loop_target_angle", 0.0)),
+                    breadcrumb_type=next_type,
+                )
+                shared_info["dribble_turn_target_xy"] = next_target_xy
+                shared_info["dribble_waypoint_index"] = next_waypoint_index
+                shared_info["dribble_loop_profile"] = next_profile
+                shared_info["dribble_loop_target_angle"] = next_target_angle
+                shared_info["dribble_breadcrumbs_reached"] = breadcrumbs_reached
+                set_current_loop_state({
                     "turn_direction": turn_direction,
                     "difficulty": difficulty,
                     "lane_scale": lane_scale,
@@ -319,8 +324,29 @@ class DribbleCarryReward(RewardFunction[AgentID, GameState, float]):
                     "breadcrumbs_reached": breadcrumbs_reached,
                     "direction_flips": direction_flips,
                     "episode_reward_sum": shared_info.get("dribble_episode_reward_sum", 0.0),
-                }
-            )
+                })
+            else:
+                # Phase B: random field waypoints
+                next_target_xy = build_random_field_target(car_pos, self.rng)
+                shared_info["dribble_turn_target_xy"] = next_target_xy
+                shared_info["dribble_waypoint_index"] = next_waypoint_index
+                shared_info["dribble_breadcrumbs_reached"] = breadcrumbs_reached
+                set_current_loop_state({
+                    "turn_direction": turn_direction,
+                    "difficulty": difficulty,
+                    "lane_scale": lane_scale,
+                    "loop_x": 0.0,
+                    "loop_y": 0.0,
+                    "safe_x": RANDOM_FIELD_SAFE_X,
+                    "safe_y": RANDOM_FIELD_SAFE_Y,
+                    "target_angle": 0.0,
+                    "target_xy": next_target_xy,
+                    "breadcrumb_index": next_waypoint_index,
+                    "breadcrumbs_reached": breadcrumbs_reached,
+                    "direction_flips": direction_flips,
+                    "episode_reward_sum": shared_info.get("dribble_episode_reward_sum", 0.0),
+                })
+
             self.prev_target_distances[agent] = float(np.linalg.norm(next_target_xy - car_pos))
 
         return reward
@@ -399,6 +425,8 @@ def build_turn_target_xy(
         )
         if breadcrumb_type == "first":
             score = 2.8 * forward_score + 0.4 * tangent_score + 0.4 * center_score
+        elif breadcrumb_type == "closing":
+            score = 0.5 * forward_score + 1.5 * tangent_score + 0.8 * center_score
         else:
             score = 1.3 * forward_score + 0.9 * tangent_score + 0.25 * center_score
         if score > best_score:
@@ -457,6 +485,49 @@ def sample_breadcrumb_type(difficulty: str, breadcrumbs_reached: int, rng) -> st
 def breadcrumb_type_arc_params(breadcrumb_type: str):
     """Return (arc_step_min, arc_step_max, arc_step_mid, min_distance, max_distance)."""
     return _BREADCRUMB_ARC_PARAMS.get(breadcrumb_type, _BREADCRUMB_ARC_PARAMS["gentle"])
+
+
+def breadcrumb_type_for_index(breadcrumb_index: int) -> str:
+    """Deterministic breadcrumb type for the loop phase (crumbs 1-5).
+
+    breadcrumb_index is breadcrumbs_reached at the time the next crumb is placed,
+    so 0 = placing the 1st crumb at spawn, 1 = placing crumb 2 after 1 is reached, etc.
+    """
+    _SCHEDULE = {0: "first", 1: "moderate", 2: "hard_turn", 3: "hard_turn", 4: "closing"}
+    return _SCHEDULE.get(breadcrumb_index, "moderate")
+
+
+def build_random_field_target(
+    car_pos_xy: np.ndarray,
+    rng,
+    min_distance: float = RANDOM_TARGET_MIN_DISTANCE,
+    max_distance: float = RANDOM_TARGET_MAX_DISTANCE,
+    safe_x: float = RANDOM_FIELD_SAFE_X,
+    safe_y: float = RANDOM_FIELD_SAFE_Y,
+) -> np.ndarray:
+    """Pick a random field point within safe margins at a reasonable distance from the car.
+
+    Uses rejection sampling with up to RANDOM_TARGET_MAX_ATTEMPTS tries, then falls back
+    to a clamped directional point.
+    """
+    car_pos_xy = np.asarray(car_pos_xy, dtype=np.float32)
+    for _ in range(RANDOM_TARGET_MAX_ATTEMPTS):
+        x = float(rng.uniform(-safe_x, safe_x))
+        y = float(rng.uniform(-safe_y, safe_y))
+        target = np.array([x, y], dtype=np.float32)
+        distance = float(np.linalg.norm(target - car_pos_xy))
+        if distance < min_distance or distance > max_distance:
+            continue
+        if not breadcrumb_segment_is_safe(car_pos_xy, target, safe_x, safe_y):
+            continue
+        return target
+
+    # Fallback: fixed distance in a random direction, clamped to safe area
+    angle = float(rng.uniform(-np.pi, np.pi))
+    fallback = car_pos_xy + min_distance * np.array([np.cos(angle), np.sin(angle)], dtype=np.float32)
+    fallback[0] = float(np.clip(fallback[0], -safe_x, safe_x))
+    fallback[1] = float(np.clip(fallback[1], -safe_y, safe_y))
+    return fallback.astype(np.float32)
 
 
 def sample_waypoint_difficulty(episode_counter, rng):
