@@ -1,0 +1,5 @@
+rlgym[rl-sim,rl-rlviser]
+rlgym-ppo @ git+https://github.com/AechPro/rlgym-ppo@main
+numpy<2.0
+torch
+wandb

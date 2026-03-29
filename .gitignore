@@ -1,0 +1,13 @@
+.env
+__pycache__/
+*.pyc
+*.pyo
+venv/
+.DS_Store
+.vscode/
+.claude/
+models/
+models-*/
+wandb/
+*.log
+rlviser
