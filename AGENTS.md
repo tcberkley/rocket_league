@@ -18,17 +18,26 @@ pip install -r requirements.txt
 ## Running Training
 
 ```bash
-PYTORCH_ENABLE_MPS_FALLBACK=1 python main.py
+PYTORCH_ENABLE_MPS_FALLBACK=1 python main.py train
 ```
 
-Checkpoints save to `models/` every 50k timesteps. To resume, set `checkpoint_load_folder="models/<number>"` in the `Learner` constructor in `learner.py`.
+Useful variants:
+
+```bash
+PYTORCH_ENABLE_MPS_FALLBACK=1 python main.py train --scenario dribble --dashboard
+python main.py watch --scenario dribble --renderer sandbox
+```
+
+Checkpoints save to `models/` every 50k timesteps and training resumes from the latest checkpoint by default unless `--fresh` is passed. The CLI also supports timed cooldowns between training segments via `--train-segment-hours` and `--cooldown-minutes`.
 
 ## Architecture
 
 ```
-main.py           Entry point; defines build_rlgym_v2_env() factory + calls run_learner()
+main.py           Entry point; defines standard/dribble env factories, watch mode, and CLI wiring
 rewards.py        Custom VelocityBallToGoalReward (v2 API); TouchReward is from rlgym built-ins
 learner.py        run_learner(env_create_func): configures and starts rlgym_ppo.Learner
+dribble.py        Dribble scenario mutator, reward shaping, and termination logic
+dribble_metrics.py Live dribble dashboard + CSV episode metrics logger
 models/           Saved PPO checkpoints (gitignored)
 ```
 
@@ -51,6 +60,21 @@ models/           Saved PPO checkpoints (gitignored)
 - `VelocityBallToGoalReward` (custom): reward in [-1, 1] proportional to ball velocity toward opponent's goal
 - `TouchReward` (built-in from rlgym): +1.0 on any touch
 - Combined weight: VelocityBallToGoal x 1.0, TouchReward x 0.5
+
+## Dribble Scenario
+
+- `main.py --scenario dribble` trains a single-car carry task instead of standard 1v1
+- `DribbleStartMutator` in `dribble.py` now uses randomized stable starts: random field position, random yaw, small hood-placement noise for the ball, and randomized initial speed
+- Goal mouths are treated as failure zones in dribble mode, so driving into the goal ends the episode
+- The dribble reward combines carry quality, forward movement while carrying, and a small anti-stall mechanism
+
+## Dashboard Metrics
+
+- `--dashboard` enables the local Tk dashboard during dribble training
+- `--dashboard-update-seconds` controls refresh cadence; the current default is `1.0`
+- The dashboard loads history from `metrics/dribble_episode_metrics.csv`
+- Charts display 50-episode rolling averages compressed into at most 480 plotted bins so long runs stay readable
+- The plotted `distance_traveled_uu` metric is episode path length in the ground plane (`x/y` step-to-step distance), not straight-line displacement from spawn
 
 ## macOS M-Series Notes
 

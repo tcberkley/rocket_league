@@ -17,6 +17,10 @@ STALL_PENALTY = 0.03
 CARRY_THRESHOLD = 0.25
 GOAL_MOUTH_X_LIMIT = common_values.GOAL_CENTER_TO_POST + 140.0
 GOAL_MOUTH_Y_LIMIT = common_values.BACK_WALL_Y - 120.0
+SPAWN_X_LIMIT = common_values.SIDE_WALL_X - 1200.0
+SPAWN_Y_LIMIT = common_values.BACK_WALL_Y - 1800.0
+BALL_FORWARD_OFFSET = 35.0
+BALL_UP_OFFSET = 141.0
 
 
 class DribbleStartMutator(StateMutator[GameState]):
@@ -24,21 +28,46 @@ class DribbleStartMutator(StateMutator[GameState]):
     Spawn a single car with the ball balanced on its hood.
     """
 
-    def __init__(self, car_speed: float = 300.0):
-        self.car_speed = car_speed
+    def __init__(self, min_car_speed: float = 250.0, max_car_speed: float = 500.0):
+        self.min_car_speed = min_car_speed
+        self.max_car_speed = max_car_speed
+        self.rng = np.random.default_rng()
 
     def apply(self, state: GameState, shared_info: Dict[str, Any]) -> None:
-        state.ball.position = np.array([0.0, -2465.0, 158.0], dtype=np.float32)
-        state.ball.linear_velocity = np.array([0.0, self.car_speed, -15.0], dtype=np.float32)
-        state.ball.angular_velocity = np.zeros(3, dtype=np.float32)
-
         for index, car in enumerate(state.cars.values()):
-            spawn_x = float(index * 800)
-            car.physics.position = np.array([spawn_x, -2500.0, 17.0], dtype=np.float32)
-            car.physics.linear_velocity = np.array([0.0, self.car_speed, 0.0], dtype=np.float32)
+            car_speed = float(self.rng.uniform(self.min_car_speed, self.max_car_speed))
+            car_yaw = float(self.rng.uniform(-np.pi, np.pi))
+            spawn_x = float(self.rng.uniform(-SPAWN_X_LIMIT, SPAWN_X_LIMIT))
+            spawn_y = float(self.rng.uniform(-SPAWN_Y_LIMIT, SPAWN_Y_LIMIT))
+
+            forward = np.array([np.cos(car_yaw), np.sin(car_yaw), 0.0], dtype=np.float32)
+            right = np.array([-np.sin(car_yaw), np.cos(car_yaw), 0.0], dtype=np.float32)
+            up = np.array([0.0, 0.0, 1.0], dtype=np.float32)
+
+            car.physics.position = np.array([spawn_x, spawn_y, 17.0], dtype=np.float32)
+            car.physics.linear_velocity = forward * car_speed
             car.physics.angular_velocity = np.zeros(3, dtype=np.float32)
-            car.physics.euler_angles = np.array([0.0, np.pi / 2, 0.0], dtype=np.float32)
+            car.physics.euler_angles = np.array([0.0, car_yaw, 0.0], dtype=np.float32)
             car.boost_amount = 100.0
+
+            if index == 0:
+                forward_noise = float(self.rng.uniform(-12.0, 12.0))
+                lateral_noise = float(self.rng.uniform(-10.0, 10.0))
+                vertical_noise = float(self.rng.uniform(-8.0, 8.0))
+                ball_velocity_noise = self.rng.uniform(-35.0, 35.0, size=3).astype(np.float32)
+
+                state.ball.position = (
+                    car.physics.position
+                    + forward * (BALL_FORWARD_OFFSET + forward_noise)
+                    + right * lateral_noise
+                    + up * (BALL_UP_OFFSET + vertical_noise)
+                ).astype(np.float32)
+                state.ball.linear_velocity = (
+                    car.physics.linear_velocity
+                    + ball_velocity_noise
+                    + np.array([0.0, 0.0, -15.0], dtype=np.float32)
+                ).astype(np.float32)
+                state.ball.angular_velocity = self.rng.uniform(-0.8, 0.8, size=3).astype(np.float32)
 
 
 class BallDroppedCondition(DoneCondition[AgentID, GameState]):

@@ -305,10 +305,10 @@ def parse_args():
     train_parser.add_argument("--scenario", choices=("standard", "dribble"), default="standard")
     train_parser.add_argument("--dashboard", action="store_true", help="Show a live local dashboard during dribble training.")
     train_parser.add_argument(
-        "--dashboard-update-every",
-        type=int,
-        default=10,
-        help="Redraw the dribble dashboard after this many completed episodes.",
+        "--dashboard-update-seconds",
+        type=float,
+        default=1.0,
+        help="Redraw the dribble dashboard on this timer in seconds.",
     )
     train_parser.add_argument("--wandb", action="store_true", help="Enable Weights & Biases logging.")
     train_parser.add_argument("--device", default="auto")
@@ -345,7 +345,7 @@ def main():
         if args.scenario == "dribble" and args.dashboard:
             from dribble_metrics import DribbleMetricsLogger
 
-            metrics_logger = DribbleMetricsLogger(dashboard_update_every=args.dashboard_update_every)
+            metrics_logger = DribbleMetricsLogger(dashboard_update_seconds=args.dashboard_update_seconds)
         run_learner(
             get_training_env_builder(args.scenario),
             checkpoint_load_folder=checkpoint,

@@ -15,6 +15,7 @@ PLOT_WIDTH = 1180
 PLOT_HEIGHT = 720
 PLOT_PADDING = 60
 ROLLING_WINDOW = 50
+MAX_RENDER_POINTS = 480
 
 
 def _rolling_average(values, window):
@@ -22,11 +23,48 @@ def _rolling_average(values, window):
         return []
 
     arr = np.asarray(values, dtype=np.float32)
-    out = []
-    for index in range(len(arr)):
-        start = max(0, index - window + 1)
-        out.append(float(arr[start:index + 1].mean()))
-    return out
+    indices = np.arange(len(arr), dtype=np.int32)
+    starts = np.maximum(indices - window + 1, 0)
+    cumulative = np.concatenate(([0.0], np.cumsum(arr, dtype=np.float64)))
+    totals = cumulative[indices + 1] - cumulative[starts]
+    counts = indices - starts + 1
+    return (totals / counts).astype(np.float32).tolist()
+
+
+def _compress_plot_series(values, max_points):
+    arr = np.asarray(values, dtype=np.float32)
+    if arr.size == 0:
+        return np.empty(0, dtype=np.float32), np.empty(0, dtype=np.float32)
+
+    if arr.size <= max_points:
+        x_values = np.arange(arr.size, dtype=np.float32)
+        return x_values, arr
+
+    bin_edges = np.linspace(0, arr.size, max_points + 1, dtype=np.int32)
+    x_values = []
+    y_values = []
+    for start, end in zip(bin_edges[:-1], bin_edges[1:]):
+        if end <= start:
+            continue
+        segment = arr[start:end]
+        x_values.append((start + end - 1) / 2)
+        y_values.append(float(segment.mean(dtype=np.float64)))
+    return np.asarray(x_values, dtype=np.float32), np.asarray(y_values, dtype=np.float32)
+
+
+def _load_metric_history():
+    if not METRICS_CSV.exists():
+        return [], []
+
+    try:
+        history = np.loadtxt(METRICS_CSV, delimiter=",", skiprows=1, ndmin=2)
+    except (OSError, ValueError):
+        return [], []
+
+    if history.size == 0 or history.shape[1] < 3:
+        return [], []
+
+    return history[:, 1].astype(np.float32).tolist(), history[:, 2].astype(np.float32).tolist()
 
 
 def _lighten_color(hex_color):
@@ -54,7 +92,7 @@ class DribbleDashboard:
             highlightthickness=0,
         )
         self.canvas.pack()
-        self.update([], [], 0)
+        self.update([], [], 0, 0)
 
     def close(self):
         if self.closed:
@@ -62,7 +100,7 @@ class DribbleDashboard:
         self.closed = True
         self.root.destroy()
 
-    def update(self, carry_seconds, distances, update_every):
+    def update(self, carry_seconds, distances, episode_count, update_seconds):
         if self.closed:
             return
 
@@ -90,8 +128,9 @@ class DribbleDashboard:
             20,
             anchor="w",
             text=(
-                f"Episodes: {len(carry_seconds)}    "
-                f"Dashboard refresh: every {update_every} episodes    "
+                f"Episodes: {episode_count}    "
+                f"Display: up to {MAX_RENDER_POINTS} bins    "
+                f"Dashboard refresh: every {update_seconds:.1f}s    "
                 f"Updated: {time.strftime('%H:%M:%S')}"
             ),
             fill="#111827",
@@ -128,9 +167,10 @@ class DribbleDashboard:
             )
             return
 
-        rolling = _rolling_average(series, ROLLING_WINDOW)
-        min_val = min(min(series), min(rolling))
-        max_val = max(max(series), max(rolling))
+        target_points = max(80, min(MAX_RENDER_POINTS, int(width)))
+        plot_x, plot_y = _compress_plot_series(series, target_points)
+        min_val = float(plot_y.min())
+        max_val = float(plot_y.max())
         if max_val - min_val < 1e-6:
             max_val = min_val + 1.0
 
@@ -148,56 +188,70 @@ class DribbleDashboard:
                 font=("Helvetica", 10),
             )
 
+        self.canvas.create_text(
+            x0,
+            y1 + 16,
+            anchor="w",
+            text="Episode 1",
+            fill="#6b7280",
+            font=("Helvetica", 10),
+        )
+        self.canvas.create_text(
+            x1,
+            y1 + 16,
+            anchor="e",
+            text=f"Episode {len(series)}",
+            fill="#6b7280",
+            font=("Helvetica", 10),
+        )
+
         rolling_points = []
-        for index, value in enumerate(rolling):
-            x = x0 + (index / max(len(rolling) - 1, 1)) * width
+        for x_value, value in zip(plot_x, plot_y):
+            x = x0 + (x_value / max(len(series) - 1, 1)) * width
             y = y1 - ((value - min_val) / (max_val - min_val)) * height
             rolling_points.extend((x, y))
 
         if len(rolling_points) >= 4:
             self.canvas.create_line(*rolling_points, fill=point_color, width=3, smooth=True)
 
-        if len(series) >= 2:
-            regression_input_x = np.arange(len(series), dtype=np.float32)
-            regression_input_y = np.asarray(series, dtype=np.float32)
-            slope, intercept = np.polyfit(regression_input_x, regression_input_y, 1)
-            start_y = intercept
-            end_y = slope * (len(series) - 1) + intercept
-            start_canvas_y = y1 - ((start_y - min_val) / (max_val - min_val)) * height
-            end_canvas_y = y1 - ((end_y - min_val) / (max_val - min_val)) * height
-            self.canvas.create_line(
-                x0,
-                start_canvas_y,
-                x1,
-                end_canvas_y,
-                fill=_lighten_color(point_color),
-                width=2,
-                dash=(8, 6),
-            )
 
 
 class DribbleMetricsLogger:
-    def __init__(self, dashboard_update_every=10):
+    def __init__(self, dashboard_update_seconds=1.0):
         self.worker_pid = None
-        self.episode_counter = 0
         self.process_state = {}
-        self.carry_seconds = []
-        self.distances = []
-        self.dashboard_update_every = max(1, int(dashboard_update_every))
-        self.last_dashboard_episode = 0
-        self.dashboard = DribbleDashboard()
+        self.dashboard_update_seconds = max(0.25, float(dashboard_update_seconds))
+        self.last_dashboard_time = 0.0
 
         METRICS_DIR.mkdir(exist_ok=True)
+        self.carry_seconds, self.distances = _load_metric_history()
+        self.carry_rolling = _rolling_average(self.carry_seconds, ROLLING_WINDOW)
+        self.distance_rolling = _rolling_average(self.distances, ROLLING_WINDOW)
+        self.episode_counter = len(self.carry_seconds)
+
         if not METRICS_CSV.exists():
             with METRICS_CSV.open("w", newline="") as handle:
                 writer = csv.writer(handle)
                 writer.writerow(["episode", "carry_seconds", "distance_traveled_uu"])
+
+        self.dashboard = DribbleDashboard()
+        self.dashboard.update(
+            self.carry_rolling,
+            self.distance_rolling,
+            self.episode_counter,
+            self.dashboard_update_seconds,
+        )
 
     def __getstate__(self):
         state = self.__dict__.copy()
         state["dashboard"] = None
         state["worker_pid"] = None
         state["process_state"] = {}
+        state["carry_seconds"] = []
+        state["distances"] = []
+        state["carry_rolling"] = []
+        state["distance_rolling"] = []
+        state["episode_counter"] = 0
         return state
 
     def __setstate__(self, state):
@@ -258,9 +312,15 @@ class DribbleMetricsLogger:
                 }
             )
 
-        if self.episode_counter - self.last_dashboard_episode >= self.dashboard_update_every:
-            self.dashboard.update(self.carry_seconds, self.distances, self.dashboard_update_every)
-            self.last_dashboard_episode = self.episode_counter
+        now = time.monotonic()
+        if now - self.last_dashboard_time >= self.dashboard_update_seconds:
+            self.dashboard.update(
+                self.carry_rolling,
+                self.distance_rolling,
+                self.episode_counter,
+                self.dashboard_update_seconds,
+            )
+            self.last_dashboard_time = now
 
     def _consume_metric(self, metric):
         pid = int(metric[0])
@@ -297,6 +357,8 @@ class DribbleMetricsLogger:
         self.episode_counter += 1
         self.carry_seconds.append(carry_seconds)
         self.distances.append(distance)
+        self.carry_rolling.append(float(np.mean(self.carry_seconds[-ROLLING_WINDOW:])))
+        self.distance_rolling.append(float(np.mean(self.distances[-ROLLING_WINDOW:])))
 
         with METRICS_CSV.open("a", newline="") as handle:
             writer = csv.writer(handle)
