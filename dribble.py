@@ -422,13 +422,11 @@ def sample_breadcrumb_type(difficulty: str, breadcrumbs_reached: int, rng) -> st
     """Sample a breadcrumb type for the next waypoint. Flips are gated by breadcrumbs_reached."""
     if difficulty == "easy":
         weights = [0.55, 0.05, 0.35, 0.05]
-        flip_min = 5
     elif difficulty == "hard":
         weights = [0.20, 0.30, 0.15, 0.35]
-        flip_min = 2
     else:  # medium
         weights = [0.30, 0.20, 0.20, 0.30]
-        flip_min = 3
+    flip_min = 3
 
     if breadcrumbs_reached < flip_min:
         # Redistribute flip weight to gentle

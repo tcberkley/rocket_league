@@ -72,7 +72,7 @@ artifacts/        Generated GIFs (rollouts and record-breakers)
 - **Reward** (5 components): carry quality (always), breadcrumb approach (while carrying), breadcrumb success bonus (1.26–1.68 by difficulty), wall/corner/approach penalties, terminal penalty (-1.0 on drop)
 - A **breadcrumb waypoint** system chains targets; each success samples the next breadcrumb type from `("gentle", "sharp", "straight", "flip")` with curriculum-weighted probabilities
 - **Breadcrumb types** by arc geometry: gentle (wide curve), sharp (tight turn), straight (nearly ahead), flip (wide curve + negate turn direction)
-- **Direction flips**: when a `"flip"` breadcrumb is reached, `turn_direction` in `shared_info` is negated so the bot must learn CW↔CCW transitions mid-episode; gated by breadcrumbs_reached (easy: 5+, medium: 3+, hard: 2+)
+- **Direction flips**: when a `"flip"` breadcrumb is reached, `turn_direction` in `shared_info` is negated so the bot must learn CW↔CCW transitions mid-episode; gated to require 3+ breadcrumbs reached regardless of difficulty
 - **Curriculum difficulty** ramps from easy → medium → hard based on episode count; weights for sharp/flip breadcrumbs increase with difficulty
 - Global state accessor `get_current_loop_state()` exposes loop info for visualization
 
