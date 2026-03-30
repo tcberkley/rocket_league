@@ -297,7 +297,8 @@ def parse_args():
     subparsers = parser.add_subparsers(dest="command")
 
     train_parser = subparsers.add_parser("train", help="Train the PPO bot.")
-    train_parser.add_argument("--timesteps", type=int, default=DEFAULT_TIMESTEP_LIMIT)
+    train_parser.add_argument("--timesteps", type=int, default=DEFAULT_TIMESTEP_LIMIT,
+                              help="Timestep limit (0 = no limit, run indefinitely)")
     train_parser.add_argument("--save-every", type=int, default=DEFAULT_SAVE_EVERY_TS)
     train_parser.add_argument("--n-proc", type=int, default=DEFAULT_N_PROC)
     train_parser.add_argument("--checkpoint", default="latest")
@@ -346,10 +347,12 @@ def main():
             from dribble_metrics import DribbleMetricsLogger
 
             metrics_logger = DribbleMetricsLogger(dashboard_update_seconds=args.dashboard_update_seconds)
+        # 0 means no limit — use the rlgym_ppo Learner's own practical maximum.
+        timestep_limit = 5_000_000_000 if args.timesteps == 0 else args.timesteps
         run_learner(
             get_training_env_builder(args.scenario),
             checkpoint_load_folder=checkpoint,
-            timestep_limit=args.timesteps,
+            timestep_limit=timestep_limit,
             save_every_ts=args.save_every,
             n_proc=args.n_proc,
             log_to_wandb=args.wandb,

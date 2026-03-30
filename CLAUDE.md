@@ -24,15 +24,21 @@ PYTORCH_ENABLE_MPS_FALLBACK=1 python main.py train
 Useful variants:
 
 ```bash
-# Fresh dribble run with dashboard
-PYTORCH_ENABLE_MPS_FALLBACK=1 python main.py train --scenario dribble --dashboard --fresh --timesteps 50000000
+# Indefinite dribble run with dashboard, 2h train / 15min cooldown
+PYTORCH_ENABLE_MPS_FALLBACK=1 python main.py train --scenario dribble --dashboard --timesteps 0 --train-segment-hours 2 --cooldown-minutes 15
+
+# Fresh run
+PYTORCH_ENABLE_MPS_FALLBACK=1 python main.py train --scenario dribble --dashboard --fresh --timesteps 0 --train-segment-hours 2 --cooldown-minutes 15
+
 # Watch a saved checkpoint
 python main.py watch --scenario dribble --renderer sandbox
 ```
 
-Checkpoints save to `models/` every 50k timesteps and training resumes from the latest checkpoint by default unless `--fresh` is passed. The CLI also supports timed cooldowns between training segments via `--train-segment-hours` and `--cooldown-minutes`.
+Checkpoints save to `models/` every 50k timesteps and training resumes from the latest checkpoint by default unless `--fresh` is passed.
 
-**Important**: always pass `--timesteps` explicitly when resuming, since the default is 10M — if the checkpoint is already at 10M timesteps the learner will exit immediately.
+**`--timesteps 0` = no limit** (internally maps to 5 billion, the rlgym_ppo Learner maximum). Any positive value is a hard cap. The default is 10M — if a checkpoint is already at 10M the learner exits immediately, so always pass `--timesteps` explicitly when resuming.
+
+**Thermal management**: `--train-segment-hours` and `--cooldown-minutes` control the train/rest cycle. The process saves a checkpoint, sleeps for the cooldown period, then resumes automatically. Recommended: `--train-segment-hours 2 --cooldown-minutes 15` on M1.
 
 ## Architecture
 
@@ -113,14 +119,35 @@ Each episode has two phases:
 - `--dashboard` enables the local Tk dashboard during dribble training
 - `--dashboard-update-seconds` controls refresh cadence; the current default is `1.0`
 - The dashboard loads history from `metrics/dribble_episode_metrics.csv`; episode stats go to `metrics/dribble_phase4_metrics.csv`
-- Dashboard layout: 2x2 chart grid (carry time, breadcrumbs reached, avg reward, wall approach penalty) + live field minimap on the right showing car trail, loop lane, waypoint, ball, and reached breadcrumbs from the last completed episode
-- Charts display 50-episode rolling averages with 5th/95th percentile bands, compressed into at most 420 plotted bins
-- Every 10k timesteps, a P95 GIF snapshot is saved to `artifacts/periodic_p95/` — picks the episode closest to the 95th percentile carry time from the last 50 episodes; GIFs show reached breadcrumbs (green ✓) and active waypoint (magenta crosshair) at proportional scale
+- Dashboard layout: 2x2 chart grid + live field minimap on the right
+
+### Dashboard Charts
+
+| Position | Metric | Color | Notes |
+|----------|--------|-------|-------|
+| Top-left | Carry Time Per Episode (s) | Blue | All episodes |
+| Top-right | Breadcrumbs Reached Per Episode | Brown/Amber | Tracked episodes; amber step line = all-time best |
+| Bottom-left | Ball Carry Rate Per Episode (0–1) | Purple | Fraction of steps ball is on car; in-memory only, resets on restart |
+| Bottom-right | Wall Approach Penalty Per Episode | Teal | Tracked episodes |
+
+All charts show 50-episode rolling mean with 5th/95th percentile bands, compressed to at most 420 plotted bins.
+
+### Minimap
+Shows the last completed episode: car trail (blue line), loop lane ellipse (amber, hidden in Phase B), active waypoint (magenta crosshair), reached breadcrumbs (green circles with ✓), ball (white), car (blue triangle). Breadcrumb count shown top-center.
+
+### Record GIFs
+A GIF is saved to `artifacts/periodic_p95/` **only when a new all-time breadcrumb count record is set**. Filename: `record_ep{N}_{crumbs}crumbs_{carry}s.gif`. Each frame shows the car trail, reached crumbs (green), and active waypoint (magenta) at game-unit-proportional scale.
+
 - Annotation markers (stored in `metrics/dribble_markers.json`) can be placed on charts to mark training milestones
-- Direction flips and near-wall carry seconds are still logged to CSV but not shown on the dashboard
+- Direction flips and near-wall carry seconds are logged to CSV but not shown on the dashboard
 
 ### Worker metrics serialization note
 `_collect_metrics` returns two arrays: a fixed 19-float metric array and a fixed-size crumb buffer (`1 + MAX_TRACKED_CRUMBS * 2 = 21` floats). The crumb buffer is always the same size so that `rlgym_ppo`'s `shm_view` (shared memory, only reallocated on agent-count change) is never overrun by a growing array.
+
+**Important**: `env.reset()` is called by rlgym_ppo workers *before* `collect_metrics(info["state"])` on terminal steps. This clears module-level globals (`REACHED_BREADCRUMB_POSITIONS`, `CURRENT_LOOP_STATE`). To work around this:
+- Reached crumb positions are tracked in `_consume_metric` by detecting when `breadcrumbs_reached` count increases (car position recorded at that step), rather than reading the global.
+- `episode_reward_sum` is not overwritten when it drops to 0 (terminal reset artifact); the last non-zero value is preserved until episode finalization.
+- The terminal step frame is trimmed from episode frame lists before saving GIFs or updating the minimap.
 
 ## macOS M-Series Notes
 

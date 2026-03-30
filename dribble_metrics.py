@@ -386,7 +386,7 @@ class DribbleDashboard:
              PLOT_PADDING, top_y),
             ("breadcrumbs_reached", "Breadcrumbs Reached Per Episode", "#b45309", "Tracked Episode",
              PLOT_PADDING + chart_w + chart_gap_x, top_y),
-            ("avg_reward", "Avg Episode Reward", "#7c3aed", "Tracked Episode",
+            ("carry_rate", "Ball Carry Rate Per Episode (0–1)", "#7c3aed", "Tracked Episode",
              PLOT_PADDING, top_y + chart_h + chart_gap_y),
             ("wall_approach_penalty", "Wall Approach Penalty Per Episode", "#0891b2", "Tracked Episode",
              PLOT_PADDING + chart_w + chart_gap_x, top_y + chart_h + chart_gap_y),
@@ -462,6 +462,12 @@ class DribbleDashboard:
         _, plot_high = _compress_plot_series(high_values, target_points)
         min_val = float(min(plot_low.min(), plot_mean.min(), plot_high.min()))
         max_val = float(max(plot_low.max(), plot_mean.max(), plot_high.max()))
+        max_series_values = spec.get("max_series", [])
+        plot_max_x, plot_max_s = (np.empty(0), np.empty(0))
+        if max_series_values:
+            plot_max_x, plot_max_s = _compress_plot_series(max_series_values, target_points)
+            if plot_max_s.size > 0:
+                max_val = float(max(max_val, float(plot_max_s.max())))
         if max_val - min_val < 1e-6:
             max_val = min_val + 1.0
 
@@ -533,7 +539,7 @@ class DribbleDashboard:
         )
 
         legend_color = _lighten_color(point_color)
-        self._draw_legend(x1, y0 - 16, point_color, legend_color)
+        self._draw_legend(x1, y0 - 16, point_color, legend_color, has_max_series=bool(max_series_values))
 
         low_points = []
         high_points = []
@@ -554,39 +560,36 @@ class DribbleDashboard:
         if len(mean_points) >= 4:
             self.canvas.create_line(*mean_points, fill=point_color, width=3, smooth=True)
 
-    def _draw_legend(self, x1, title_y, point_color, legend_color):
+        if plot_max_s.size >= 2:
+            max_points = []
+            n_ref = max(len(mean_values) - 1, 1)
+            for x_value, max_value in zip(plot_max_x, plot_max_s):
+                x = x0 + (float(x_value) / n_ref) * width
+                my = y1 - ((float(max_value) - min_val) / (max_val - min_val)) * height
+                max_points.extend((x, my))
+            if len(max_points) >= 4:
+                self.canvas.create_line(*max_points, fill="#f59e0b", width=2, smooth=False)
+
+    def _draw_legend(self, x1, title_y, point_color, legend_color, has_max_series=False):
         base_y = title_y + 2
-        gap = 52
 
-        self.canvas.create_line(x1 - 165, base_y, x1 - 145, base_y, fill=point_color, width=3)
-        self.canvas.create_text(
-            x1 - 141,
-            base_y,
-            anchor="w",
-            text="mean",
-            fill=point_color,
-            font=LEGEND_FONT,
-        )
-
-        self.canvas.create_line(x1 - 103, base_y, x1 - 83, base_y, fill=legend_color, width=2, dash=(6, 6))
-        self.canvas.create_text(
-            x1 - 79,
-            base_y,
-            anchor="w",
-            text="5th",
-            fill=legend_color,
-            font=LEGEND_FONT,
-        )
-
-        self.canvas.create_line(x1 - 47, base_y, x1 - 27, base_y, fill=legend_color, width=2, dash=(6, 6))
-        self.canvas.create_text(
-            x1 - 23,
-            base_y,
-            anchor="w",
-            text="95th",
-            fill=legend_color,
-            font=LEGEND_FONT,
-        )
+        if has_max_series:
+            # Shift items left to make room for the "best" entry on the right.
+            self.canvas.create_line(x1 - 215, base_y, x1 - 195, base_y, fill=point_color, width=3)
+            self.canvas.create_text(x1 - 191, base_y, anchor="w", text="mean", fill=point_color, font=LEGEND_FONT)
+            self.canvas.create_line(x1 - 153, base_y, x1 - 133, base_y, fill=legend_color, width=2, dash=(6, 6))
+            self.canvas.create_text(x1 - 129, base_y, anchor="w", text="5th", fill=legend_color, font=LEGEND_FONT)
+            self.canvas.create_line(x1 - 97, base_y, x1 - 77, base_y, fill=legend_color, width=2, dash=(6, 6))
+            self.canvas.create_text(x1 - 73, base_y, anchor="w", text="95th", fill=legend_color, font=LEGEND_FONT)
+            self.canvas.create_line(x1 - 41, base_y, x1 - 21, base_y, fill="#f59e0b", width=2)
+            self.canvas.create_text(x1 - 17, base_y, anchor="w", text="best", fill="#f59e0b", font=LEGEND_FONT)
+        else:
+            self.canvas.create_line(x1 - 165, base_y, x1 - 145, base_y, fill=point_color, width=3)
+            self.canvas.create_text(x1 - 141, base_y, anchor="w", text="mean", fill=point_color, font=LEGEND_FONT)
+            self.canvas.create_line(x1 - 103, base_y, x1 - 83, base_y, fill=legend_color, width=2, dash=(6, 6))
+            self.canvas.create_text(x1 - 79, base_y, anchor="w", text="5th", fill=legend_color, font=LEGEND_FONT)
+            self.canvas.create_line(x1 - 47, base_y, x1 - 27, base_y, fill=legend_color, width=2, dash=(6, 6))
+            self.canvas.create_text(x1 - 23, base_y, anchor="w", text="95th", fill=legend_color, font=LEGEND_FONT)
 
 
 class DribbleMetricsLogger:
@@ -616,7 +619,18 @@ class DribbleMetricsLogger:
         self.breadcrumbs_reached_rolling = _rolling_average(self.breadcrumbs_reached, ROLLING_WINDOW)
         self.breadcrumbs_reached_p05 = _rolling_percentile(self.breadcrumbs_reached, ROLLING_WINDOW, 5)
         self.breadcrumbs_reached_p95 = _rolling_percentile(self.breadcrumbs_reached, ROLLING_WINDOW, 95)
+        # Running max of breadcrumbs_reached (for "best so far" line)
+        self.breadcrumbs_max_series = []
+        running_max = 0.0
+        for val in self.breadcrumbs_reached:
+            running_max = max(running_max, val)
+            self.breadcrumbs_max_series.append(running_max)
         self.avg_reward_rolling = _rolling_average(self.avg_reward, ROLLING_WINDOW)
+        # Carry rate (fraction of steps ball is on car) — in-memory only, not persisted
+        self.carry_rate = []
+        self.carry_rate_rolling = []
+        self.carry_rate_p05 = []
+        self.carry_rate_p95 = []
         self.avg_reward_p05 = _rolling_percentile(self.avg_reward, ROLLING_WINDOW, 5)
         self.avg_reward_p95 = _rolling_percentile(self.avg_reward, ROLLING_WINDOW, 95)
         self.wall_approach_penalty_rolling = _rolling_average(self.wall_approach_penalty, ROLLING_WINDOW)
@@ -628,7 +642,6 @@ class DribbleMetricsLogger:
 
         self.episode_frame_buffer = deque(maxlen=ROLLING_WINDOW)
         self.last_episode_frames = []
-        self.last_gif_episode = 0
         self.cumulative_timesteps = 0
 
         if not METRICS_CSV.exists():
@@ -674,6 +687,10 @@ class DribbleMetricsLogger:
             "breadcrumbs_reached_p05",
             "breadcrumbs_reached_p95",
             "avg_reward_rolling",
+            "carry_rate",
+            "carry_rate_rolling",
+            "carry_rate_p05",
+            "carry_rate_p95",
             "avg_reward_p05",
             "avg_reward_p95",
             "wall_approach_penalty_rolling",
@@ -685,8 +702,12 @@ class DribbleMetricsLogger:
         state["episode_counter"] = 0
         state["episode_frame_buffer"] = deque(maxlen=ROLLING_WINDOW)
         state["last_episode_frames"] = []
-        state["last_gif_episode"] = 0
         state["cumulative_timesteps"] = 0
+        state["breadcrumbs_max_series"] = []
+        state["carry_rate"] = []
+        state["carry_rate_rolling"] = []
+        state["carry_rate_p05"] = []
+        state["carry_rate_p95"] = []
         return state
 
     def __setstate__(self, state):
@@ -825,10 +846,6 @@ class DribbleMetricsLogger:
                 )
             wandb_run.log(log_data)
 
-        if self.episode_counter - self.last_gif_episode >= P95_GIF_EPISODE_INTERVAL:
-            self._save_p95_gif()
-            self.last_gif_episode = self.episode_counter
-
         now = time.monotonic()
         if now - self.last_dashboard_time >= self.dashboard_update_seconds:
             self.dashboard.update(
@@ -853,13 +870,14 @@ class DribbleMetricsLogger:
                 "mean": self.breadcrumbs_reached_rolling,
                 "p05": self.breadcrumbs_reached_p05,
                 "p95": self.breadcrumbs_reached_p95,
+                "max_series": self.breadcrumbs_max_series,
                 "markers": tracked_markers,
                 "x_end_label": tracked_count,
             },
-            "avg_reward": {
-                "mean": self.avg_reward_rolling,
-                "p05": self.avg_reward_p05,
-                "p95": self.avg_reward_p95,
+            "carry_rate": {
+                "mean": self.carry_rate_rolling,
+                "p05": self.carry_rate_p05,
+                "p95": self.carry_rate_p95,
                 "markers": tracked_markers,
                 "x_end_label": tracked_count,
             },
@@ -889,13 +907,6 @@ class DribbleMetricsLogger:
         loop_x = float(metric[16])
         loop_y = float(metric[17])
         episode_reward_sum = float(metric[18])
-        reached_crumbs = list(reached_crumbs)
-
-        def _initial_frame():
-            return self._build_episode_frame(
-                position, current_heading, ball_position, target_position, has_target, loop_x, loop_y,
-                reached_crumbs=reached_crumbs,
-            )
 
         state = self.process_state.get(pid)
         if state is None:
@@ -910,7 +921,11 @@ class DribbleMetricsLogger:
                 "episode_reward_sum": episode_reward_sum,
                 "wall_approach_penalty": wall_approach_penalty,
                 "near_wall_carry_steps": 1 if carrying and near_wall_flag else 0,
-                "frames": [_initial_frame()],
+                "crumb_positions": [],
+                "frames": [self._build_episode_frame(
+                    position, current_heading, ball_position, target_position, has_target, loop_x, loop_y,
+                    reached_crumbs=[],
+                )],
             }
             return
 
@@ -926,8 +941,18 @@ class DribbleMetricsLogger:
             state["episode_reward_sum"] = episode_reward_sum
             state["wall_approach_penalty"] = wall_approach_penalty
             state["near_wall_carry_steps"] = 1 if carrying and near_wall_flag else 0
-            state["frames"] = [_initial_frame()]
+            state["crumb_positions"] = []
+            state["frames"] = [self._build_episode_frame(
+                position, current_heading, ball_position, target_position, has_target, loop_x, loop_y,
+                reached_crumbs=[],
+            )]
             return
+
+        # Detect when a new crumb is reached and record car position.
+        # This avoids relying on REACHED_BREADCRUMB_POSITIONS globals, which are cleared
+        # by env.reset() before collect_metrics is called on the terminal step.
+        if breadcrumbs_reached > state["breadcrumbs_reached"]:
+            state["crumb_positions"].append([float(position[0]), float(position[1])])
 
         step_distance = float(np.linalg.norm(position - state["last_pos"]))
         state["distance"] += step_distance
@@ -937,11 +962,17 @@ class DribbleMetricsLogger:
             state["near_wall_carry_steps"] += 1
         state["breadcrumbs_reached"] = max(state["breadcrumbs_reached"], breadcrumbs_reached)
         state["direction_flips"] = max(state["direction_flips"], direction_flips)
-        state["episode_reward_sum"] = episode_reward_sum
+        # episode_reward_sum is reset to 0 when env.reset() runs before collect_metrics.
+        # Only overwrite when the new value is non-zero or we're still at zero (first steps).
+        if episode_reward_sum != 0.0 or state["episode_reward_sum"] == 0.0:
+            state["episode_reward_sum"] = episode_reward_sum
         state["wall_approach_penalty"] += wall_approach_penalty
         state["last_pos"] = position
         state["last_tick"] = tick_count
-        state["frames"].append(_initial_frame())
+        state["frames"].append(self._build_episode_frame(
+            position, current_heading, ball_position, target_position, has_target, loop_x, loop_y,
+            reached_crumbs=list(state["crumb_positions"]),
+        ))
 
     def _finalize_episode(self, state):
         carry_seconds = state["carry_steps"] / DECISIONS_PER_SECOND
@@ -950,6 +981,7 @@ class DribbleMetricsLogger:
         direction_flips = state["direction_flips"]
         total_steps = max(state.get("total_steps", 1), 1)
         avg_reward = state["episode_reward_sum"] / total_steps
+        carry_rate = state["carry_steps"] / total_steps
         wall_approach_penalty = state["wall_approach_penalty"]
         near_wall_carry_seconds = state["near_wall_carry_steps"] / DECISIONS_PER_SECOND
         self.episode_counter += 1
@@ -972,6 +1004,13 @@ class DribbleMetricsLogger:
             self.avg_reward_p05,
             self.avg_reward_p95,
             avg_reward,
+        )
+        _append_rolling_stats(
+            self.carry_rate,
+            self.carry_rate_rolling,
+            self.carry_rate_p05,
+            self.carry_rate_p95,
+            carry_rate,
         )
         _append_rolling_stats(
             self.wall_approach_penalty,
@@ -1000,7 +1039,19 @@ class DribbleMetricsLogger:
             )
 
         episode_frames = list(state.get("frames", []))
-        self.episode_frame_buffer.append((carry_seconds, episode_frames))
+        # The last frame was collected AFTER env.reset() cleared globals (loop_x=0, crumbs=[]).
+        # Drop it so GIFs and the minimap show only in-episode data.
+        if len(episode_frames) > 1:
+            episode_frames = episode_frames[:-1]
+
+        # Track running max and save a GIF only when a new crumb record is set.
+        prev_max = self.breadcrumbs_max_series[-1] if self.breadcrumbs_max_series else 0.0
+        new_max = max(prev_max, breadcrumbs_reached)
+        self.breadcrumbs_max_series.append(new_max)
+        if new_max > prev_max and episode_frames:
+            self._save_record_gif(breadcrumbs_reached, carry_seconds, episode_frames)
+
+        self.episode_frame_buffer.append((breadcrumbs_reached, carry_seconds, episode_frames))
         self.last_episode_frames = episode_frames
 
     @staticmethod
@@ -1037,22 +1088,10 @@ class DribbleMetricsLogger:
             "reached_crumbs": [list(c) for c in reached_crumbs],
         }
 
-    def _save_p95_gif(self):
-        if not self.episode_frame_buffer:
-            return
-
-        carry_values = [cs for cs, _ in self.episode_frame_buffer]
-        p95_value = float(np.percentile(carry_values, 95))
-        best_carry, best_frames = min(
-            self.episode_frame_buffer, key=lambda pair: abs(pair[0] - p95_value),
-        )
-
-        if not best_frames:
-            return
-
-        sampled_frames = best_frames[::EPISODE_GIF_FRAME_STRIDE]
-        if sampled_frames[-1] is not best_frames[-1]:
-            sampled_frames.append(best_frames[-1])
+    def _save_record_gif(self, breadcrumbs_reached, carry_seconds, episode_frames):
+        sampled_frames = episode_frames[::EPISODE_GIF_FRAME_STRIDE]
+        if sampled_frames[-1] is not episode_frames[-1]:
+            sampled_frames.append(episode_frames[-1])
 
         images = []
         for index, frame in enumerate(sampled_frames):
@@ -1060,15 +1099,16 @@ class DribbleMetricsLogger:
                 _draw_episode_frame(
                     frame,
                     (
-                        f"P95 snapshot | ep {self.episode_counter} | "
-                        f"carry {best_carry:.2f}s | "
+                        f"NEW RECORD | ep {self.episode_counter} | "
+                        f"{breadcrumbs_reached:.0f} crumbs | "
+                        f"carry {carry_seconds:.2f}s | "
                         f"frame {index + 1}/{len(sampled_frames)}"
                     ),
-                    trail=best_frames,
+                    trail=episode_frames,
                 )
             )
 
-        filename = f"p95_ep{self.episode_counter:07d}_{best_carry:.2f}s.gif"
+        filename = f"record_ep{self.episode_counter:07d}_{breadcrumbs_reached:.0f}crumbs_{carry_seconds:.2f}s.gif"
         output_path = P95_GIFS_DIR / filename
         images[0].save(
             output_path,
@@ -1078,4 +1118,4 @@ class DribbleMetricsLogger:
             loop=0,
             optimize=False,
         )
-        print(f"Saved P95 GIF: {output_path}")
+        print(f"New crumb record GIF: {output_path}")
