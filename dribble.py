@@ -28,6 +28,9 @@ BREADCRUMB_PROGRESS_REWARD_SCALE = 1 / 260.0
 WALL_PENALTY_SCALE = 0.035
 CORNER_PENALTY_SCALE = 0.06
 WALL_APPROACH_PENALTY_SCALE = 0.09
+SPEED_COMFORT_CENTER = 450.0   # uu/s — ideal dribble speed; peak of the comfort reward
+SPEED_COMFORT_SIGMA = 350.0    # Gaussian half-width; ~700 uu/s yields ~75% of peak
+SPEED_COMFORT_SCALE = 0.06     # per-step reward at peak (comparable to carry quality's 0.10)
 CARRY_THRESHOLD = 0.25
 
 GOAL_MOUTH_X_LIMIT = common_values.GOAL_CENTER_TO_POST + 140.0
@@ -231,7 +234,14 @@ class DribbleCarryReward(RewardFunction[AgentID, GameState, float]):
                 # 2. Breadcrumb approach + success (handles direction flips internally)
                 reward += self._breadcrumb_rewards(agent, car, car_pos, carry_quality, shared_info)
 
-                # 3. Wall penalties
+                # 3. Speed comfort zone: Gaussian bell centered at SPEED_COMFORT_CENTER.
+                # Rewards moderate dribbling speed; decays toward 0 at high speed so the
+                # agent learns to slow down for turns instead of always sprinting.
+                speed_xy = float(np.linalg.norm(car.physics.linear_velocity[:2]))
+                speed_factor = float(np.exp(-((speed_xy - SPEED_COMFORT_CENTER) / SPEED_COMFORT_SIGMA) ** 2))
+                reward += SPEED_COMFORT_SCALE * carry_quality * speed_factor
+
+                # 4. Wall penalties
                 wall_pressure = wall_pressure_score(car_pos)
                 corner_pressure = corner_pressure_score(car_pos)
                 wall_approach = wall_approach_score(car_pos, car.physics.forward[:2], car.physics.linear_velocity[:2])
@@ -565,8 +575,8 @@ def waypoint_profile(difficulty, lane_scale=1.0):
             "target_jitter": 50.0,
             "spawn_normal_noise": 70.0,
             "spawn_tangent_noise": 110.0,
-            "speed_min": 320.0,
-            "speed_max": 520.0,
+            "speed_min": 200.0,
+            "speed_max": 400.0,
             "yaw_noise": 0.10,
         }
     if difficulty == "hard":
@@ -580,8 +590,8 @@ def waypoint_profile(difficulty, lane_scale=1.0):
             "target_jitter": 85.0,
             "spawn_normal_noise": 95.0,
             "spawn_tangent_noise": 140.0,
-            "speed_min": 430.0,
-            "speed_max": 700.0,
+            "speed_min": 300.0,
+            "speed_max": 550.0,
             "yaw_noise": 0.16,
         }
     # medium
@@ -595,8 +605,8 @@ def waypoint_profile(difficulty, lane_scale=1.0):
         "target_jitter": 65.0,
         "spawn_normal_noise": 80.0,
         "spawn_tangent_noise": 120.0,
-        "speed_min": 360.0,
-        "speed_max": 610.0,
+        "speed_min": 250.0,
+        "speed_max": 480.0,
         "yaw_noise": 0.13,
     }
 

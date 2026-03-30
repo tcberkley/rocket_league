@@ -78,7 +78,7 @@ artifacts/        Generated GIFs (rollouts and record-breakers)
 
 - `main.py --scenario dribble` trains a single-car carry task instead of standard 1v1
 - **Termination**: ball touching ground (`ball_pos[2] < 100.0`), or car/ball entering a goal mouth
-- **Reward** (5 components): carry quality (always), breadcrumb approach (while carrying), breadcrumb success bonus (1.26–1.68 by difficulty), wall/corner/approach penalties, terminal penalty (-1.0 on drop)
+- **Reward** (6 components): carry quality (always), breadcrumb approach (while carrying), breadcrumb success bonus (1.26–1.68 by difficulty), speed comfort zone (while carrying), wall/corner/approach penalties, terminal penalty (-1.0 on drop)
 
 ### Spawn Geometry
 
@@ -112,6 +112,12 @@ Each episode has two phases:
 **Phase B — Random field (breadcrumb 6+):** After completing the loop, waypoints are sampled randomly across the field (`RANDOM_FIELD_SAFE_X/Y` margins), 1500–4000 uu from the car. The loop lane ellipse is hidden in the visualizer when phase B begins.
 
 - **Curriculum difficulty** ramps from easy → medium → hard based on episode count (affects spawn speed, ellipse size, and loop lane margins)
+
+| Difficulty | Episodes | Speed min (uu/s) | Speed max (uu/s) |
+|------------|----------|------------------|------------------|
+| Easy       | 0–2500   | 200              | 400              |
+| Medium     | 2500–8000| 250              | 480              |
+| Hard       | 8000+    | 300              | 550              |
 - Global state accessor `get_current_loop_state()` exposes loop info for visualization; `loop_x=0/loop_y=0` signals Phase B to renderers
 
 ## Dashboard Metrics
@@ -127,7 +133,7 @@ Each episode has two phases:
 |----------|--------|-------|-------|
 | Top-left | Carry Time Per Episode (s) | Blue | All episodes |
 | Top-right | Breadcrumbs Reached Per Episode | Brown/Amber | Tracked episodes; amber step line = all-time best |
-| Bottom-left | Ball Carry Rate Per Episode (0–1) | Purple | Fraction of steps ball is on car; in-memory only, resets on restart |
+| Bottom-left | Avg Car Speed Per Episode (uu/s) | Purple | In-memory only, resets on restart |
 | Bottom-right | Wall Approach Penalty Per Episode | Teal | Tracked episodes |
 
 All charts show 50-episode rolling mean with 5th/95th percentile bands, compressed to at most 420 plotted bins.
@@ -142,7 +148,7 @@ A GIF is saved to `artifacts/periodic_p95/` **only when a new all-time breadcrum
 - Direction flips and near-wall carry seconds are logged to CSV but not shown on the dashboard
 
 ### Worker metrics serialization note
-`_collect_metrics` returns two arrays: a fixed 19-float metric array and a fixed-size crumb buffer (`1 + MAX_TRACKED_CRUMBS * 2 = 21` floats). The crumb buffer is always the same size so that `rlgym_ppo`'s `shm_view` (shared memory, only reallocated on agent-count change) is never overrun by a growing array.
+`_collect_metrics` returns two arrays: a fixed 20-float metric array and a fixed-size crumb buffer (`1 + MAX_TRACKED_CRUMBS * 2 = 21` floats). The crumb buffer is always the same size so that `rlgym_ppo`'s `shm_view` (shared memory, only reallocated on agent-count change) is never overrun by a growing array.
 
 **Important**: `env.reset()` is called by rlgym_ppo workers *before* `collect_metrics(info["state"])` on terminal steps. This clears module-level globals (`REACHED_BREADCRUMB_POSITIONS`, `CURRENT_LOOP_STATE`). To work around this:
 - Reached crumb positions are tracked in `_consume_metric` by detecting when `breadcrumbs_reached` count increases (car position recorded at that step), rather than reading the global.

@@ -386,7 +386,7 @@ class DribbleDashboard:
              PLOT_PADDING, top_y),
             ("breadcrumbs_reached", "Breadcrumbs Reached Per Episode", "#b45309", "Tracked Episode",
              PLOT_PADDING + chart_w + chart_gap_x, top_y),
-            ("carry_rate", "Ball Carry Rate Per Episode (0–1)", "#7c3aed", "Tracked Episode",
+            ("avg_speed", "Avg Car Speed Per Episode (uu/s)", "#7c3aed", "Tracked Episode",
              PLOT_PADDING, top_y + chart_h + chart_gap_y),
             ("wall_approach_penalty", "Wall Approach Penalty Per Episode", "#0891b2", "Tracked Episode",
              PLOT_PADDING + chart_w + chart_gap_x, top_y + chart_h + chart_gap_y),
@@ -631,6 +631,11 @@ class DribbleMetricsLogger:
         self.carry_rate_rolling = []
         self.carry_rate_p05 = []
         self.carry_rate_p95 = []
+        # Avg car speed per episode (uu/s) — in-memory only, not persisted
+        self.avg_speed = []
+        self.avg_speed_rolling = []
+        self.avg_speed_p05 = []
+        self.avg_speed_p95 = []
         self.avg_reward_p05 = _rolling_percentile(self.avg_reward, ROLLING_WINDOW, 5)
         self.avg_reward_p95 = _rolling_percentile(self.avg_reward, ROLLING_WINDOW, 95)
         self.wall_approach_penalty_rolling = _rolling_average(self.wall_approach_penalty, ROLLING_WINDOW)
@@ -708,6 +713,10 @@ class DribbleMetricsLogger:
         state["carry_rate_rolling"] = []
         state["carry_rate_p05"] = []
         state["carry_rate_p95"] = []
+        state["avg_speed"] = []
+        state["avg_speed_rolling"] = []
+        state["avg_speed_p05"] = []
+        state["avg_speed_p95"] = []
         return state
 
     def __setstate__(self, state):
@@ -767,12 +776,14 @@ class DribbleMetricsLogger:
         )
         near_wall_flag = 1.0 if carrying > 0.5 and near_wall_warning_score(car.physics.position[:2]) > 0.0 else 0.0
 
-        # Metric array layout (19 elements):
+        car_speed_xy = float(np.linalg.norm(car.physics.linear_velocity[:2]))
+
+        # Metric array layout (20 elements):
         # 0: worker_pid, 1: tick_count, 2: car_x, 3: car_y, 4: heading,
         # 5: ball_x, 6: ball_y, 7: carrying, 8: turn_direction,
         # 9: breadcrumbs_reached, 10: direction_flips, 11: wall_approach_penalty,
         # 12: near_wall_flag, 13: target_x, 14: target_y, 15: has_target,
-        # 16: loop_x, 17: loop_y, 18: episode_reward_sum
+        # 16: loop_x, 17: loop_y, 18: episode_reward_sum, 19: car_speed_xy
         metric = np.array(
             [
                 float(self.worker_pid),
@@ -794,6 +805,7 @@ class DribbleMetricsLogger:
                 loop_x,
                 loop_y,
                 episode_reward_sum,
+                car_speed_xy,
             ],
             dtype=np.float32,
         )
@@ -816,7 +828,7 @@ class DribbleMetricsLogger:
             if not metrics_arrays:
                 continue
             metric = np.asarray(metrics_arrays[0], dtype=np.float32)
-            if metric.size != 19:
+            if metric.size != 20:
                 continue
             reached_crumbs = []
             if len(metrics_arrays) > 1:
@@ -874,10 +886,10 @@ class DribbleMetricsLogger:
                 "markers": tracked_markers,
                 "x_end_label": tracked_count,
             },
-            "carry_rate": {
-                "mean": self.carry_rate_rolling,
-                "p05": self.carry_rate_p05,
-                "p95": self.carry_rate_p95,
+            "avg_speed": {
+                "mean": self.avg_speed_rolling,
+                "p05": self.avg_speed_p05,
+                "p95": self.avg_speed_p95,
                 "markers": tracked_markers,
                 "x_end_label": tracked_count,
             },
@@ -907,6 +919,7 @@ class DribbleMetricsLogger:
         loop_x = float(metric[16])
         loop_y = float(metric[17])
         episode_reward_sum = float(metric[18])
+        car_speed_xy = float(metric[19])
 
         state = self.process_state.get(pid)
         if state is None:
@@ -916,6 +929,7 @@ class DribbleMetricsLogger:
                 "carry_steps": 1 if carrying else 0,
                 "total_steps": 1,
                 "distance": 0.0,
+                "speed_sum": car_speed_xy,
                 "breadcrumbs_reached": breadcrumbs_reached,
                 "direction_flips": direction_flips,
                 "episode_reward_sum": episode_reward_sum,
@@ -941,6 +955,7 @@ class DribbleMetricsLogger:
             state["episode_reward_sum"] = episode_reward_sum
             state["wall_approach_penalty"] = wall_approach_penalty
             state["near_wall_carry_steps"] = 1 if carrying and near_wall_flag else 0
+            state["speed_sum"] = car_speed_xy
             state["crumb_positions"] = []
             state["frames"] = [self._build_episode_frame(
                 position, current_heading, ball_position, target_position, has_target, loop_x, loop_y,
@@ -958,6 +973,7 @@ class DribbleMetricsLogger:
         state["distance"] += step_distance
         state["carry_steps"] += 1 if carrying else 0
         state["total_steps"] = state.get("total_steps", 0) + 1
+        state["speed_sum"] = state.get("speed_sum", 0.0) + car_speed_xy
         if carrying and near_wall_flag:
             state["near_wall_carry_steps"] += 1
         state["breadcrumbs_reached"] = max(state["breadcrumbs_reached"], breadcrumbs_reached)
@@ -982,6 +998,7 @@ class DribbleMetricsLogger:
         total_steps = max(state.get("total_steps", 1), 1)
         avg_reward = state["episode_reward_sum"] / total_steps
         carry_rate = state["carry_steps"] / total_steps
+        avg_speed = state.get("speed_sum", 0.0) / total_steps
         wall_approach_penalty = state["wall_approach_penalty"]
         near_wall_carry_seconds = state["near_wall_carry_steps"] / DECISIONS_PER_SECOND
         self.episode_counter += 1
@@ -1011,6 +1028,13 @@ class DribbleMetricsLogger:
             self.carry_rate_p05,
             self.carry_rate_p95,
             carry_rate,
+        )
+        _append_rolling_stats(
+            self.avg_speed,
+            self.avg_speed_rolling,
+            self.avg_speed_p05,
+            self.avg_speed_p95,
+            avg_speed,
         )
         _append_rolling_stats(
             self.wall_approach_penalty,
