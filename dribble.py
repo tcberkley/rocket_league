@@ -31,7 +31,7 @@ CORNER_PENALTY_SCALE = 0.06
 WALL_APPROACH_PENALTY_SCALE = 0.09
 SPEED_COMFORT_CENTER = 450.0   # uu/s — ideal dribble speed; peak of the comfort reward
 SPEED_COMFORT_SIGMA = 350.0    # Gaussian half-width; ~700 uu/s yields ~75% of peak
-SPEED_COMFORT_SCALE = 0.06     # per-step reward at peak (comparable to carry quality's 0.10)
+SPEED_COMFORT_SCALE = 0.10     # per-step reward at peak (same weight as carry quality)
 CARRY_THRESHOLD = 0.25
 
 GOAL_MOUTH_X_LIMIT = common_values.GOAL_CENTER_TO_POST + 140.0
