@@ -24,11 +24,15 @@ PYTORCH_ENABLE_MPS_FALLBACK=1 python main.py train
 Useful variants:
 
 ```bash
-PYTORCH_ENABLE_MPS_FALLBACK=1 python main.py train --scenario dribble --dashboard
+# Fresh dribble run with dashboard
+PYTORCH_ENABLE_MPS_FALLBACK=1 python main.py train --scenario dribble --dashboard --fresh --timesteps 50000000
+# Watch a saved checkpoint
 python main.py watch --scenario dribble --renderer sandbox
 ```
 
 Checkpoints save to `models/` every 50k timesteps and training resumes from the latest checkpoint by default unless `--fresh` is passed. The CLI also supports timed cooldowns between training segments via `--train-segment-hours` and `--cooldown-minutes`.
+
+**Important**: always pass `--timesteps` explicitly when resuming, since the default is 10M — if the checkpoint is already at 10M timesteps the learner will exit immediately.
 
 ## Architecture
 
@@ -67,9 +71,23 @@ artifacts/        Generated GIFs (rollouts and record-breakers)
 ## Dribble Scenario
 
 - `main.py --scenario dribble` trains a single-car carry task instead of standard 1v1
-- `DribbleStartMutator` spawns the car at a random ellipse position with the ball on its hood
 - **Termination**: ball touching ground (`ball_pos[2] < 100.0`), or car/ball entering a goal mouth
 - **Reward** (5 components): carry quality (always), breadcrumb approach (while carrying), breadcrumb success bonus (1.26–1.68 by difficulty), wall/corner/approach penalties, terminal penalty (-1.0 on drop)
+
+### Spawn Geometry
+
+`DribbleStartMutator` spawns using a strict tangent-line setup each episode:
+
+1. A random `spawn_angle` is sampled on the ellipse
+2. `tangent_point = ellipse_point(spawn_angle)` — the intersection point on the ellipse
+3. `tangent_dir = ellipse_tangent(spawn_angle)` — the true tangent direction at that point
+4. Car is placed 2000–3500 uu back along the tangent line: `spawn_xy = tangent_point - tangent_dir * spawn_distance`
+5. `_max_safe_spawn_distance()` caps the distance so the car never needs to be clamped off the line
+6. **First waypoint = `tangent_point`** — exactly where the tangent line meets the ellipse
+7. Car velocity is along `tangent_dir` (exact); car facing has small yaw noise (±5–9°) for variety
+8. Ball is placed on the hood with random noise offsets
+
+This means the agent always starts with a long straight-line dribble before entering the ellipse loop.
 
 ### Two-Phase Breadcrumb System
 
@@ -79,11 +97,11 @@ Each episode has two phases:
 
 | Crumb | Type | Arc (rad) | Distance (uu) | Purpose |
 |-------|------|-----------|---------------|---------|
-| 1 | `first` | 0.01–0.12 | 350–750 | Close, straight ahead |
-| 2 | `moderate` | 0.80–1.20 | 1800–3200 | Moderate turn |
-| 3 | `hard_turn` | 1.10–1.60 | 2200–3800 | Sharp turn |
-| 4 | `hard_turn` | 1.10–1.60 | 2200–3800 | Sharp turn |
-| 5 | `closing` | 1.80–2.80 | 2000–4500 | Large arc to close the loop |
+| 1 | `first` | 0.01–0.12 | 350–750 | Tangent entry point — straight ahead |
+| 2 | `moderate` | 0.30–0.60 | 800–1600 | Close along the circle after entering |
+| 3 | `hard_turn` | 1.20–1.75 | 2200–3800 | Sharp turn |
+| 4 | `hard_turn` | 1.20–1.75 | 2200–3800 | Sharp turn |
+| 5 | `closing` | 2.09–3.09 | 2000–4500 | Large arc to close the loop |
 
 **Phase B — Random field (breadcrumb 6+):** After completing the loop, waypoints are sampled randomly across the field (`RANDOM_FIELD_SAFE_X/Y` margins), 1500–4000 uu from the car. The loop lane ellipse is hidden in the visualizer when phase B begins.
 
@@ -95,11 +113,14 @@ Each episode has two phases:
 - `--dashboard` enables the local Tk dashboard during dribble training
 - `--dashboard-update-seconds` controls refresh cadence; the current default is `1.0`
 - The dashboard loads history from `metrics/dribble_episode_metrics.csv`; episode stats go to `metrics/dribble_phase4_metrics.csv`
-- Dashboard layout: 2x2 chart grid (carry time, breadcrumbs reached, avg reward, direction flips) + live field minimap on the right showing car trail, loop lane, waypoint, and ball from the last completed episode
+- Dashboard layout: 2x2 chart grid (carry time, breadcrumbs reached, avg reward, wall approach penalty) + live field minimap on the right showing car trail, loop lane, waypoint, ball, and reached breadcrumbs from the last completed episode
 - Charts display 50-episode rolling averages with 5th/95th percentile bands, compressed into at most 420 plotted bins
-- Every 10k timesteps, a P95 GIF snapshot is saved to `artifacts/periodic_p95/` — picks the episode closest to the 95th percentile carry time from the last 50 episodes
+- Every 10k timesteps, a P95 GIF snapshot is saved to `artifacts/periodic_p95/` — picks the episode closest to the 95th percentile carry time from the last 50 episodes; GIFs show reached breadcrumbs (green ✓) and active waypoint (magenta crosshair) at proportional scale
 - Annotation markers (stored in `metrics/dribble_markers.json`) can be placed on charts to mark training milestones
-- Wall approach penalty and near-wall carry seconds are still logged to CSV but not shown on the dashboard
+- Direction flips and near-wall carry seconds are still logged to CSV but not shown on the dashboard
+
+### Worker metrics serialization note
+`_collect_metrics` returns two arrays: a fixed 19-float metric array and a fixed-size crumb buffer (`1 + MAX_TRACKED_CRUMBS * 2 = 21` floats). The crumb buffer is always the same size so that `rlgym_ppo`'s `shm_view` (shared memory, only reallocated on agent-count change) is never overrun by a growing array.
 
 ## macOS M-Series Notes
 

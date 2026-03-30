@@ -16,6 +16,7 @@ from dribble import (
     WALL_APPROACH_PENALTY_SCALE,
     get_current_loop_state,
     get_dribble_alignment,
+    get_reached_breadcrumb_positions,
     heading_angle,
     near_wall_warning_score,
     wall_approach_score,
@@ -48,6 +49,7 @@ EPISODE_GIF_PADDING = 40
 EPISODE_GIF_FRAME_STRIDE = 2
 EPISODE_GIF_FRAME_DURATION_MS = 1000 // 12
 P95_GIF_EPISODE_INTERVAL = 10_000
+MAX_TRACKED_CRUMBS = 10  # fixed-size crumb slot so shm_view is never resized
 
 
 def _rolling_average(values, window):
@@ -249,10 +251,14 @@ def _rotated_triangle(center_x, center_y, angle, length=34, width=22):
     return out
 
 
+_BALL_RADIUS_UU = 91.25  # game-unit ball radius
+
+
 def _draw_episode_frame(frame, title, canvas_width=EPISODE_GIF_WIDTH, canvas_height=EPISODE_GIF_HEIGHT, padding=EPISODE_GIF_PADDING, trail=None):
     image = Image.new("RGB", (canvas_width, canvas_height), "#135d36")
     draw = ImageDraw.Draw(image)
     scale = _field_scale(canvas_width, canvas_height, padding)
+    ball_r = max(8, int(_BALL_RADIUS_UU * scale))
 
     def to_canvas(pos):
         return _field_to_canvas(pos, canvas_width, canvas_height, scale)
@@ -286,17 +292,28 @@ def _draw_episode_frame(frame, title, canvas_width=EPISODE_GIF_WIDTH, canvas_hei
         trail_points = [to_canvas((f["car_x"], f["car_y"])) for f in trail]
         draw.line(trail_points, fill="#93c5fd", width=2)
 
+    reached_crumbs = frame.get("reached_crumbs", [])
+    for crumb_xy in reached_crumbs:
+        cx, cy = to_canvas((crumb_xy[0], crumb_xy[1]))
+        r = ball_r
+        draw.ellipse((cx - r, cy - r, cx + r, cy + r), fill="#22c55e", outline="#14532d", width=2)
+        draw.text((cx, cy), "✓", fill="#14532d", anchor="mm")
+
+    crumb_count = len(reached_crumbs)
+    draw.text((canvas_width // 2, 16), f"Breadcrumbs: {crumb_count}", fill="#22c55e", anchor="mt")
+
     target_x = float(frame.get("target_x", 0.0))
     target_y = float(frame.get("target_y", 0.0))
     if frame.get("has_target", False):
         wp_x, wp_y = to_canvas((target_x, target_y))
-        draw.ellipse((wp_x - 16, wp_y - 16, wp_x + 16, wp_y + 16), outline="#ff4fd8", width=4)
-        draw.line((wp_x - 20, wp_y, wp_x + 20, wp_y), fill="#ff4fd8", width=3)
-        draw.line((wp_x, wp_y - 20, wp_x, wp_y + 20), fill="#ff4fd8", width=3)
-        draw.text((wp_x + 14, wp_y - 28), "WP", fill="#ff4fd8")
+        draw.ellipse((wp_x - ball_r, wp_y - ball_r, wp_x + ball_r, wp_y + ball_r), outline="#ff4fd8", width=3)
+        xhair = ball_r + 4
+        draw.line((wp_x - xhair, wp_y, wp_x + xhair, wp_y), fill="#ff4fd8", width=2)
+        draw.line((wp_x, wp_y - xhair, wp_x, wp_y + xhair), fill="#ff4fd8", width=2)
+        draw.text((wp_x + ball_r + 2, wp_y - ball_r - 2), "WP", fill="#ff4fd8")
 
     ball_x, ball_y = to_canvas((frame["ball_x"], frame["ball_y"]))
-    draw.ellipse((ball_x - 10, ball_y - 10, ball_x + 10, ball_y + 10), fill="#f8fafc")
+    draw.ellipse((ball_x - ball_r, ball_y - ball_r, ball_x + ball_r, ball_y + ball_r), fill="#f8fafc")
 
     car_x, car_y = to_canvas((frame["car_x"], frame["car_y"]))
     draw.polygon(_rotated_triangle(car_x, car_y, frame["heading"]), fill="#55a4ff", outline="#0f172a")
@@ -371,7 +388,7 @@ class DribbleDashboard:
              PLOT_PADDING + chart_w + chart_gap_x, top_y),
             ("avg_reward", "Avg Episode Reward", "#7c3aed", "Tracked Episode",
              PLOT_PADDING, top_y + chart_h + chart_gap_y),
-            ("direction_flips", "Direction Flips Per Episode", "#0891b2", "Tracked Episode",
+            ("wall_approach_penalty", "Wall Approach Penalty Per Episode", "#0891b2", "Tracked Episode",
              PLOT_PADDING + chart_w + chart_gap_x, top_y + chart_h + chart_gap_y),
         ]
         for key, title, color, x_prefix, x0, y0 in chart_specs:
@@ -599,12 +616,12 @@ class DribbleMetricsLogger:
         self.breadcrumbs_reached_rolling = _rolling_average(self.breadcrumbs_reached, ROLLING_WINDOW)
         self.breadcrumbs_reached_p05 = _rolling_percentile(self.breadcrumbs_reached, ROLLING_WINDOW, 5)
         self.breadcrumbs_reached_p95 = _rolling_percentile(self.breadcrumbs_reached, ROLLING_WINDOW, 95)
-        self.direction_flips_rolling = _rolling_average(self.direction_flips, ROLLING_WINDOW)
-        self.direction_flips_p05 = _rolling_percentile(self.direction_flips, ROLLING_WINDOW, 5)
-        self.direction_flips_p95 = _rolling_percentile(self.direction_flips, ROLLING_WINDOW, 95)
         self.avg_reward_rolling = _rolling_average(self.avg_reward, ROLLING_WINDOW)
         self.avg_reward_p05 = _rolling_percentile(self.avg_reward, ROLLING_WINDOW, 5)
         self.avg_reward_p95 = _rolling_percentile(self.avg_reward, ROLLING_WINDOW, 95)
+        self.wall_approach_penalty_rolling = _rolling_average(self.wall_approach_penalty, ROLLING_WINDOW)
+        self.wall_approach_penalty_p05 = _rolling_percentile(self.wall_approach_penalty, ROLLING_WINDOW, 5)
+        self.wall_approach_penalty_p95 = _rolling_percentile(self.wall_approach_penalty, ROLLING_WINDOW, 95)
 
         self.markers = _load_markers()
         self.episode_counter = len(self.carry_seconds)
@@ -656,12 +673,12 @@ class DribbleMetricsLogger:
             "breadcrumbs_reached_rolling",
             "breadcrumbs_reached_p05",
             "breadcrumbs_reached_p95",
-            "direction_flips_rolling",
-            "direction_flips_p05",
-            "direction_flips_p95",
             "avg_reward_rolling",
             "avg_reward_p05",
             "avg_reward_p95",
+            "wall_approach_penalty_rolling",
+            "wall_approach_penalty_p05",
+            "wall_approach_penalty_p95",
             "markers",
         ):
             state[key] = []
@@ -759,7 +776,16 @@ class DribbleMetricsLogger:
             ],
             dtype=np.float32,
         )
-        return [metric]
+        # Always emit a fixed-size crumb buffer so shm_view is never resized.
+        # Layout: [n_valid, x0, y0, x1, y1, ..., <zeros>] with MAX_TRACKED_CRUMBS slots.
+        reached_positions = get_reached_breadcrumb_positions()
+        crumb_array = np.zeros(1 + MAX_TRACKED_CRUMBS * 2, dtype=np.float32)
+        n_valid = min(len(reached_positions), MAX_TRACKED_CRUMBS)
+        crumb_array[0] = float(n_valid)
+        for i, pos in enumerate(reached_positions[:n_valid]):
+            crumb_array[1 + i * 2] = float(pos[0])
+            crumb_array[1 + i * 2 + 1] = float(pos[1])
+        return [metric, crumb_array]
 
     def report_metrics(self, collected_metrics, wandb_run, cumulative_timesteps):
         self.cumulative_timesteps = cumulative_timesteps
@@ -771,7 +797,15 @@ class DribbleMetricsLogger:
             metric = np.asarray(metrics_arrays[0], dtype=np.float32)
             if metric.size != 19:
                 continue
-            self._consume_metric(metric)
+            reached_crumbs = []
+            if len(metrics_arrays) > 1:
+                raw = np.asarray(metrics_arrays[1], dtype=np.float32)
+                if raw.size >= 1:
+                    n_valid = int(raw[0])
+                    pairs = raw[1:1 + n_valid * 2]
+                    if pairs.size == n_valid * 2 and n_valid > 0:
+                        reached_crumbs = pairs.reshape(-1, 2).tolist()
+            self._consume_metric(metric, reached_crumbs)
 
         if wandb_run is not None and self.carry_seconds:
             log_data = {
@@ -829,16 +863,16 @@ class DribbleMetricsLogger:
                 "markers": tracked_markers,
                 "x_end_label": tracked_count,
             },
-            "direction_flips": {
-                "mean": self.direction_flips_rolling,
-                "p05": self.direction_flips_p05,
-                "p95": self.direction_flips_p95,
+            "wall_approach_penalty": {
+                "mean": self.wall_approach_penalty_rolling,
+                "p05": self.wall_approach_penalty_p05,
+                "p95": self.wall_approach_penalty_p95,
                 "markers": tracked_markers,
                 "x_end_label": tracked_count,
             },
         }
 
-    def _consume_metric(self, metric):
+    def _consume_metric(self, metric, reached_crumbs=()):
         pid = int(metric[0])
         tick_count = int(metric[1])
         position = metric[2:4].astype(np.float32)
@@ -855,10 +889,12 @@ class DribbleMetricsLogger:
         loop_x = float(metric[16])
         loop_y = float(metric[17])
         episode_reward_sum = float(metric[18])
+        reached_crumbs = list(reached_crumbs)
 
         def _initial_frame():
             return self._build_episode_frame(
                 position, current_heading, ball_position, target_position, has_target, loop_x, loop_y,
+                reached_crumbs=reached_crumbs,
             )
 
         state = self.process_state.get(pid)
@@ -929,13 +965,7 @@ class DribbleMetricsLogger:
             self.breadcrumbs_reached_p95,
             breadcrumbs_reached,
         )
-        _append_rolling_stats(
-            self.direction_flips,
-            self.direction_flips_rolling,
-            self.direction_flips_p05,
-            self.direction_flips_p95,
-            direction_flips,
-        )
+        self.direction_flips.append(direction_flips)
         _append_rolling_stats(
             self.avg_reward,
             self.avg_reward_rolling,
@@ -943,7 +973,13 @@ class DribbleMetricsLogger:
             self.avg_reward_p95,
             avg_reward,
         )
-        self.wall_approach_penalty.append(wall_approach_penalty)
+        _append_rolling_stats(
+            self.wall_approach_penalty,
+            self.wall_approach_penalty_rolling,
+            self.wall_approach_penalty_p05,
+            self.wall_approach_penalty_p95,
+            wall_approach_penalty,
+        )
         self.near_wall_carry_seconds.append(near_wall_carry_seconds)
 
         with METRICS_CSV.open("a", newline="") as handle:
@@ -986,7 +1022,7 @@ class DribbleMetricsLogger:
         return metrics_arrays
 
     @staticmethod
-    def _build_episode_frame(position, current_heading, ball_position, target_position, has_target, loop_x, loop_y):
+    def _build_episode_frame(position, current_heading, ball_position, target_position, has_target, loop_x, loop_y, reached_crumbs=()):
         return {
             "car_x": float(position[0]),
             "car_y": float(position[1]),
@@ -998,6 +1034,7 @@ class DribbleMetricsLogger:
             "has_target": bool(has_target),
             "loop_x": float(loop_x),
             "loop_y": float(loop_y),
+            "reached_crumbs": [list(c) for c in reached_crumbs],
         }
 
     def _save_p95_gif(self):

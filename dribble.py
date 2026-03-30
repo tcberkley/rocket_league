@@ -46,12 +46,12 @@ RANDOM_TARGET_MAX_DISTANCE = 4000.0
 RANDOM_TARGET_MAX_ATTEMPTS = 30
 
 # Breadcrumb types and their arc parameters: (arc_step_min, arc_step_max, arc_step_mid, min_distance, max_distance)
-# Loop-phase types cover ~2π total: first(0.06) + moderate(1.0) + hard_turn(1.35) + hard_turn(1.35) + closing(2.30) ≈ 6.06
+# Loop-phase types cover ~2π total: first(0.06) + moderate(0.45) + hard_turn(1.48) + hard_turn(1.48) + closing(2.59) ≈ 6.06
 _BREADCRUMB_ARC_PARAMS = {
     "first":     (0.01, 0.12, 0.06,  350.0,  750.0),   # crumb 1: close, nearly straight ahead
-    "moderate":  (0.80, 1.20, 1.00, 1800.0, 3200.0),   # crumb 2: moderate turn
-    "hard_turn": (1.10, 1.60, 1.35, 2200.0, 3800.0),   # crumbs 3-4: sharp turns
-    "closing":   (1.80, 2.80, 2.30, 2000.0, 4500.0),   # crumb 5: large arc to close the loop
+    "moderate":  (0.30, 0.60, 0.45,  800.0, 1600.0),   # crumb 2: close along the circle after entering
+    "hard_turn": (1.20, 1.75, 1.48, 2200.0, 3800.0),   # crumbs 3-4: sharp turns
+    "closing":   (2.09, 3.09, 2.59, 2000.0, 4500.0),   # crumb 5: large arc to close the loop
     "gentle":    (0.12, 0.25, 0.19,  800.0, 1600.0),   # legacy
     "sharp":     (0.50, 0.85, 0.68, 1200.0, 2800.0),   # legacy
     "straight":  (0.02, 0.08, 0.05,  600.0, 1400.0),   # legacy
@@ -79,36 +79,39 @@ class DribbleStartMutator(StateMutator[GameState]):
         difficulty = sample_waypoint_difficulty(self.episode_counter, self.rng)
         lane_scale = sample_lane_scale(difficulty, self.rng)
         turn_direction = 1.0 if self.episode_counter % 2 == 1 else -1.0
-        base_profile = waypoint_profile(difficulty, lane_scale)
+        profile = waypoint_profile(difficulty, lane_scale)
 
         spawn_angle = float(self.rng.uniform(-np.pi, np.pi))
-        spawn_xy = build_spawn_position(spawn_angle, base_profile, self.rng)
-        tangent_dir = ellipse_tangent(spawn_angle, base_profile["loop_x"], base_profile["loop_y"], turn_direction)
-        yaw_noise = float(self.rng.uniform(-base_profile["yaw_noise"], base_profile["yaw_noise"]))
-        tangent_angle = float(np.arctan2(tangent_dir[1], tangent_dir[0])) + yaw_noise
 
+        # First crumb is the tangent point on the ellipse.
+        # Car spawns outside the ellipse, approaching along the tangent line.
+        tangent_point = ellipse_point(spawn_angle, profile["loop_x"], profile["loop_y"])
+        tangent_dir = ellipse_tangent(spawn_angle, profile["loop_x"], profile["loop_y"], turn_direction)
+        tangent_angle = float(np.arctan2(float(tangent_dir[1]), float(tangent_dir[0])))
+
+        # Cap spawn_distance so the car stays on the tangent line without needing to clamp position.
+        max_d = _max_safe_spawn_distance(tangent_point, tangent_dir, SAFE_FIELD_X, SAFE_FIELD_Y)
+        spawn_distance = min(float(self.rng.uniform(2000.0, 3500.0)), max_d - 50.0)
+        spawn_distance = max(spawn_distance, 500.0)
+        spawn_xy = (tangent_point - tangent_dir * spawn_distance).astype(np.float32)
+
+        # Velocity is exactly along the tangent so the car travels straight toward the first waypoint.
+        # Facing has small yaw noise so the car starts slightly angled — adds variety without breaking the line.
         forward = np.array([np.cos(tangent_angle), np.sin(tangent_angle), 0.0], dtype=np.float32)
         right = np.array([-np.sin(tangent_angle), np.cos(tangent_angle), 0.0], dtype=np.float32)
         up = np.array([0.0, 0.0, 1.0], dtype=np.float32)
-        car_speed = float(self.rng.uniform(base_profile["speed_min"], base_profile["speed_max"]))
+        yaw_noise = float(self.rng.uniform(-profile["yaw_noise"], profile["yaw_noise"]))
+        facing_angle = tangent_angle + yaw_noise
+        car_speed = float(self.rng.uniform(profile["speed_min"], profile["speed_max"]))
 
-        target_xy, target_angle, profile = build_turn_target_xy(
-            spawn_xy,
-            forward[:2],
-            right[:2],
-            turn_direction,
-            self.rng,
-            difficulty=difficulty,
-            lane_scale=lane_scale,
-            current_target_angle=spawn_angle,
-            breadcrumb_type="first",
-        )
+        target_xy = tangent_point.copy()
+        target_angle = spawn_angle
 
         for index, car in enumerate(state.cars.values()):
             car.physics.position = np.array([spawn_xy[0], spawn_xy[1], 17.0], dtype=np.float32)
-            car.physics.linear_velocity = forward * car_speed
+            car.physics.linear_velocity = forward * car_speed  # along exact tangent
             car.physics.angular_velocity = np.zeros(3, dtype=np.float32)
-            car.physics.euler_angles = np.array([0.0, tangent_angle, 0.0], dtype=np.float32)
+            car.physics.euler_angles = np.array([0.0, facing_angle, 0.0], dtype=np.float32)
             car.boost_amount = 100.0
 
             if index != 0:
@@ -644,6 +647,22 @@ def ellipse_tangent(angle: float, loop_x: float, loop_y: float, turn_direction: 
     if turn_direction < 0.0:
         tangent *= -1.0
     return safe_normalize(tangent)
+
+
+def _max_safe_spawn_distance(tangent_point: np.ndarray, tangent_dir: np.ndarray, safe_x: float, safe_y: float) -> float:
+    """Largest d >= 0 such that (tangent_point - tangent_dir * d) stays within safe bounds."""
+    d_max = float("inf")
+    for dim, bound in ((0, safe_x), (1, safe_y)):
+        td = float(tangent_dir[dim])
+        if abs(td) < 1e-9:
+            continue
+        tp = float(tangent_point[dim])
+        # Need: -bound <= tp - td*d <= bound
+        if td > 0:
+            d_max = min(d_max, (tp + bound) / td)
+        else:
+            d_max = min(d_max, (tp - bound) / td)
+    return max(0.0, d_max)
 
 
 def breadcrumb_segment_is_safe(car_pos_xy, target_xy, safe_x: float, safe_y: float) -> bool:
