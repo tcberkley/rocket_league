@@ -6,6 +6,7 @@ from rlgym.api import AgentID, RewardFunction, StateMutator
 from rlgym.api.config.done_condition import DoneCondition
 from rlgym.rocket_league import common_values
 from rlgym.rocket_league.api import GameState
+from rlgym.rocket_league.obs_builders import DefaultObs
 
 DRIBBLE_EPISODE_SECONDS = 20
 DRIBBLE_TICK_SKIP = 8
@@ -184,6 +185,43 @@ class BallDroppedCondition(DoneCondition[AgentID, GameState]):
             or (bool(agents) and is_in_goal_mouth(state.cars[agents[0]].physics.position))
         )
         return {agent: done for agent in agents}
+
+
+N_WAYPOINT_OBS = 4  # dx_norm, dy_norm, bearing_cos, bearing_sin appended to DefaultObs
+
+
+class DribbleObs(DefaultObs):
+    """
+    DefaultObs extended with 4 relative waypoint features appended at the end:
+      - dx_norm, dy_norm: waypoint position relative to car, normalised by BACK_NET_Y
+      - bearing_cos, bearing_sin: how directly ahead the waypoint is (dot/cross with car forward)
+    All four are zero when no waypoint is active.
+    """
+
+    def get_obs_space(self, agent):
+        obs_type, size = super().get_obs_space(agent)
+        return obs_type, size + N_WAYPOINT_OBS
+
+    def build_obs(self, agents, state, shared_info):
+        base_obs = super().build_obs(agents, state, shared_info)
+        turn_target = shared_info.get("dribble_turn_target_xy")
+        for agent in agents:
+            car = state.cars[agent]
+            if turn_target is not None:
+                target_xy = np.asarray(turn_target, dtype=np.float32)
+                diff = (target_xy - car.physics.position[:2]).astype(np.float32)
+                dist = float(np.linalg.norm(diff))
+                dx_norm = float(diff[0]) / common_values.BACK_NET_Y
+                dy_norm = float(diff[1]) / common_values.BACK_NET_Y
+                dir_xy = (diff / dist) if dist > 1e-6 else car.physics.forward[:2]
+                fwd = car.physics.forward[:2]
+                bearing_cos = float(np.dot(fwd, dir_xy))
+                bearing_sin = float(fwd[0] * float(dir_xy[1]) - fwd[1] * float(dir_xy[0]))
+            else:
+                dx_norm = dy_norm = bearing_cos = bearing_sin = 0.0
+            waypoint_feats = np.array([dx_norm, dy_norm, bearing_cos, bearing_sin], dtype=np.float32)
+            base_obs[agent] = np.concatenate([base_obs[agent], waypoint_feats])
+        return base_obs
 
 
 class DribbleCarryReward(RewardFunction[AgentID, GameState, float]):

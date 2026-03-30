@@ -13,13 +13,50 @@ EXP_BUFFER_SIZE = 30_000
 PPO_BATCH_SIZE = 10_000
 PPO_MINIBATCH_SIZE = 5_000
 PPO_EPOCHS = 3
-PPO_ENT_COEF = 0.01
+PPO_ENT_COEF = 0.03  # bumped from 0.01 to encourage re-exploration after obs change
 POLICY_LR = 3e-4
 CRITIC_LR = 3e-4
 POLICY_LAYER_SIZES = (256, 256, 256)
 CRITIC_LAYER_SIZES = (256, 256, 256)
 DEFAULT_TRAIN_SEGMENT_SECONDS = 3 * 60 * 60
 DEFAULT_COOLDOWN_SECONDS = 15 * 60
+
+
+_DRIBBLE_OBS_BEFORE_WAYPOINT = 92   # DefaultObs with zero_padding=1
+_DRIBBLE_OBS_AFTER_WAYPOINT = 96    # + 4 waypoint features (dx, dy, bearing_cos, bearing_sin)
+
+
+def migrate_dribble_waypoint_obs(checkpoint_path: str) -> None:
+    """
+    Expand the first layer of policy/critic from obs_size=92 to 96 (4 new waypoint features).
+    New input columns are initialised to zero so the policy starts where it left off
+    and gradually learns to use the waypoint signal.  Idempotent — skipped if already migrated.
+    """
+    import torch
+
+    migrated_any = False
+    for filename in ("PPO_POLICY.pt", "PPO_VALUE_NET.pt"):
+        filepath = Path(checkpoint_path) / filename
+        if not filepath.exists():
+            continue
+        state_dict = torch.load(str(filepath), map_location="cpu", weights_only=True)
+        w = state_dict.get("model.0.weight")
+        if w is None or w.shape[1] != _DRIBBLE_OBS_BEFORE_WAYPOINT:
+            continue  # Already migrated or unexpected shape
+        n_extra = _DRIBBLE_OBS_AFTER_WAYPOINT - _DRIBBLE_OBS_BEFORE_WAYPOINT
+        padding = torch.zeros(w.shape[0], n_extra, dtype=w.dtype)
+        state_dict["model.0.weight"] = torch.cat([w, padding], dim=1)
+        torch.save(state_dict, str(filepath))
+        print(f"[obs-migration] {filename}: input {_DRIBBLE_OBS_BEFORE_WAYPOINT} → {_DRIBBLE_OBS_AFTER_WAYPOINT}")
+        migrated_any = True
+
+    if migrated_any:
+        # Optimizer momentum buffers are now stale — clear them so Adam restarts cleanly.
+        for filename in ("PPO_POLICY_OPTIMIZER.pt", "PPO_VALUE_NET_OPTIMIZER.pt"):
+            filepath = Path(checkpoint_path) / filename
+            if filepath.exists():
+                filepath.unlink()
+                print(f"[obs-migration] cleared {filename} (optimizer reset)")
 
 
 def prepare_runtime_locale():
@@ -232,12 +269,15 @@ def run_learner(
     train_segment_seconds=DEFAULT_TRAIN_SEGMENT_SECONDS,
     cooldown_seconds=DEFAULT_COOLDOWN_SECONDS,
     metrics_logger=None,
+    checkpoint_migrate_fn=None,
 ):
     prepare_runtime_locale()
 
     MODELS_DIR.mkdir(exist_ok=True)
 
     checkpoint_path = resolve_checkpoint_folder(checkpoint_load_folder)
+    if checkpoint_path is not None and checkpoint_migrate_fn is not None:
+        checkpoint_migrate_fn(checkpoint_path)
     effective_save_every_ts = save_every_ts
     if timestep_limit is not None:
         effective_save_every_ts = min(save_every_ts, timestep_limit)

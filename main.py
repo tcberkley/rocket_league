@@ -11,6 +11,7 @@ from learner import (
     DEFAULT_COOLDOWN_SECONDS,
     DEFAULT_TIMESTEP_LIMIT,
     DEFAULT_TRAIN_SEGMENT_SECONDS,
+    migrate_dribble_waypoint_obs,
     prepare_runtime_locale,
     resolve_checkpoint_folder,
     run_learner,
@@ -113,12 +114,11 @@ def build_dribble_rlgym_v2_env(render=False):
     from rlgym.rocket_league import common_values
     from rlgym.rocket_league.action_parsers import LookupTableAction, RepeatAction
     from rlgym.rocket_league.done_conditions import AnyCondition, TimeoutCondition
-    from rlgym.rocket_league.obs_builders import DefaultObs
     from rlgym.rocket_league.sim import RocketSimEngine
     from rlgym.rocket_league.state_mutators import FixedTeamSizeMutator, MutatorSequence
     from rlgym_ppo.util import RLGymV2GymWrapper
 
-    from dribble import BallDroppedCondition, DribbleCarryReward, DribbleStartMutator, DRIBBLE_EPISODE_SECONDS, DRIBBLE_TICK_SKIP
+    from dribble import BallDroppedCondition, DribbleCarryReward, DribbleObs, DribbleStartMutator, DRIBBLE_EPISODE_SECONDS, DRIBBLE_TICK_SKIP
 
     tick_skip = DRIBBLE_TICK_SKIP
     renderer = None
@@ -162,7 +162,7 @@ def build_dribble_rlgym_v2_env(render=False):
             FixedTeamSizeMutator(blue_size=1, orange_size=0),
             DribbleStartMutator(),
         ),
-        obs_builder=DefaultObs(
+        obs_builder=DribbleObs(
             zero_padding=1,
             pos_coef=np.asarray(
                 [
@@ -360,6 +360,7 @@ def main():
             train_segment_seconds=args.train_segment_hours * 3600,
             cooldown_seconds=args.cooldown_minutes * 60,
             metrics_logger=metrics_logger,
+            checkpoint_migrate_fn=migrate_dribble_waypoint_obs if args.scenario == "dribble" else None,
         )
         return
 
