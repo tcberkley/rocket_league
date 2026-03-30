@@ -31,8 +31,12 @@ def migrate_dribble_waypoint_obs(checkpoint_path: str) -> None:
     Expand the first layer of policy/critic from obs_size=92 to 96 (4 new waypoint features).
     New input columns are initialised to zero so the policy starts where it left off
     and gradually learns to use the waypoint signal.  Idempotent — skipped if already migrated.
+    Recreates fresh Adam optimizer files so rlgym_ppo can load them without error.
     """
     import torch
+    import torch.optim as optim
+    from rlgym_ppo.ppo.discrete_policy import DiscreteFF
+    from rlgym_ppo.ppo.value_estimator import ValueEstimator
 
     migrated_any = False
     for filename in ("PPO_POLICY.pt", "PPO_VALUE_NET.pt"):
@@ -51,12 +55,22 @@ def migrate_dribble_waypoint_obs(checkpoint_path: str) -> None:
         migrated_any = True
 
     if migrated_any:
-        # Optimizer momentum buffers are now stale — clear them so Adam restarts cleanly.
-        for filename in ("PPO_POLICY_OPTIMIZER.pt", "PPO_VALUE_NET_OPTIMIZER.pt"):
-            filepath = Path(checkpoint_path) / filename
-            if filepath.exists():
-                filepath.unlink()
-                print(f"[obs-migration] cleared {filename} (optimizer reset)")
+        # Recreate fresh Adam optimizer files — old ones are stale after weight shape change.
+        policy_state = torch.load(str(Path(checkpoint_path) / "PPO_POLICY.pt"), map_location="cpu", weights_only=True)
+        action_count = policy_state["model.6.weight"].shape[0]
+
+        policy = DiscreteFF(_DRIBBLE_OBS_AFTER_WAYPOINT, action_count, POLICY_LAYER_SIZES, "cpu")
+        policy.load_state_dict(policy_state)
+        policy_opt = optim.Adam(policy.parameters(), lr=POLICY_LR)
+        torch.save(policy_opt.state_dict(), str(Path(checkpoint_path) / "PPO_POLICY_OPTIMIZER.pt"))
+
+        value_net = ValueEstimator(_DRIBBLE_OBS_AFTER_WAYPOINT, CRITIC_LAYER_SIZES, "cpu")
+        value_state = torch.load(str(Path(checkpoint_path) / "PPO_VALUE_NET.pt"), map_location="cpu", weights_only=True)
+        value_net.load_state_dict(value_state)
+        value_opt = optim.Adam(value_net.parameters(), lr=CRITIC_LR)
+        torch.save(value_opt.state_dict(), str(Path(checkpoint_path) / "PPO_VALUE_NET_OPTIMIZER.pt"))
+
+        print(f"[obs-migration] recreated fresh optimizer state files")
 
 
 def prepare_runtime_locale():
