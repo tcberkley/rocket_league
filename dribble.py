@@ -51,7 +51,7 @@ RANDOM_TARGET_MAX_ATTEMPTS = 30
 # Breadcrumb types and their arc parameters: (arc_step_min, arc_step_max, arc_step_mid, min_distance, max_distance)
 # Loop-phase types cover ~2π total: first(0.06) + moderate(0.45) + hard_turn(1.48) + hard_turn(1.48) + closing(2.59) ≈ 6.06
 _BREADCRUMB_ARC_PARAMS = {
-    "first":     (0.01, 0.12, 0.06,  350.0,  750.0),   # crumb 1: close, nearly straight ahead
+    "first":     (0.01, 0.08, 0.04,  350.0,  600.0),   # crumb 1: close, nearly straight ahead
     "moderate":  (0.30, 0.60, 0.45,  800.0, 1600.0),   # crumb 2: close along the circle after entering
     "hard_turn": (1.20, 1.75, 1.48, 2200.0, 3800.0),   # crumbs 3-4: sharp turns
     "closing":   (2.09, 3.09, 2.59, 2000.0, 4500.0),   # crumb 5: large arc to close the loop
@@ -94,8 +94,8 @@ class DribbleStartMutator(StateMutator[GameState]):
 
         # Cap spawn_distance so the car stays on the tangent line without needing to clamp position.
         max_d = _max_safe_spawn_distance(tangent_point, tangent_dir, SAFE_FIELD_X, SAFE_FIELD_Y)
-        spawn_distance = min(float(self.rng.uniform(2000.0, 3500.0)), max_d - 50.0)
-        spawn_distance = max(spawn_distance, 500.0)
+        spawn_distance = min(float(self.rng.uniform(500.0, 1500.0)), max_d - 50.0)
+        spawn_distance = max(spawn_distance, 200.0)
         spawn_xy = (tangent_point - tangent_dir * spawn_distance).astype(np.float32)
 
         # Velocity is exactly along the tangent so the car travels straight toward the first waypoint.
@@ -149,10 +149,10 @@ class DribbleStartMutator(StateMutator[GameState]):
                 }
             )
 
-            forward_noise = float(self.rng.uniform(-14.0, 14.0))
-            lateral_noise = float(self.rng.uniform(-10.0, 10.0))
-            vertical_noise = float(self.rng.uniform(-10.0, 10.0))
-            ball_velocity_noise = self.rng.uniform(-40.0, 40.0, size=3).astype(np.float32)
+            forward_noise = float(self.rng.uniform(-5.0, 5.0))
+            lateral_noise = float(self.rng.uniform(-4.0, 4.0))
+            vertical_noise = float(self.rng.uniform(-4.0, 4.0))
+            ball_velocity_noise = self.rng.uniform(-15.0, 15.0, size=3).astype(np.float32)
 
             state.ball.position = (
                 car.physics.position
@@ -165,7 +165,7 @@ class DribbleStartMutator(StateMutator[GameState]):
                 + ball_velocity_noise
                 + np.array([0.0, 0.0, -15.0], dtype=np.float32)
             ).astype(np.float32)
-            state.ball.angular_velocity = self.rng.uniform(-0.8, 0.8, size=3).astype(np.float32)
+            state.ball.angular_velocity = self.rng.uniform(-0.3, 0.3, size=3).astype(np.float32)
 
 
 class BallDroppedCondition(DoneCondition[AgentID, GameState]):
@@ -575,8 +575,8 @@ def waypoint_profile(difficulty, lane_scale=1.0):
             "target_jitter": 50.0,
             "spawn_normal_noise": 70.0,
             "spawn_tangent_noise": 110.0,
-            "speed_min": 200.0,
-            "speed_max": 400.0,
+            "speed_min": 150.0,
+            "speed_max": 350.0,
             "yaw_noise": 0.10,
         }
     if difficulty == "hard":
@@ -605,8 +605,8 @@ def waypoint_profile(difficulty, lane_scale=1.0):
         "target_jitter": 65.0,
         "spawn_normal_noise": 80.0,
         "spawn_tangent_noise": 120.0,
-        "speed_min": 250.0,
-        "speed_max": 480.0,
+        "speed_min": 200.0,
+        "speed_max": 400.0,
         "yaw_noise": 0.13,
     }
 

@@ -87,7 +87,7 @@ artifacts/        Generated GIFs (rollouts and record-breakers)
 1. A random `spawn_angle` is sampled on the ellipse
 2. `tangent_point = ellipse_point(spawn_angle)` — the intersection point on the ellipse
 3. `tangent_dir = ellipse_tangent(spawn_angle)` — the true tangent direction at that point
-4. Car is placed 2000–3500 uu back along the tangent line: `spawn_xy = tangent_point - tangent_dir * spawn_distance`
+4. Car is placed 500–1500 uu back along the tangent line: `spawn_xy = tangent_point - tangent_dir * spawn_distance`
 5. `_max_safe_spawn_distance()` caps the distance so the car never needs to be clamped off the line
 6. **First waypoint = `tangent_point`** — exactly where the tangent line meets the ellipse
 7. Car velocity is along `tangent_dir` (exact); car facing has small yaw noise (±5–9°) for variety
@@ -115,8 +115,8 @@ Each episode has two phases:
 
 | Difficulty | Episodes | Speed min (uu/s) | Speed max (uu/s) |
 |------------|----------|------------------|------------------|
-| Easy       | 0–2500   | 200              | 400              |
-| Medium     | 2500–8000| 250              | 480              |
+| Easy       | 0–2500   | 150              | 350              |
+| Medium     | 2500–8000| 200              | 400              |
 | Hard       | 8000+    | 300              | 550              |
 - Global state accessor `get_current_loop_state()` exposes loop info for visualization; `loop_x=0/loop_y=0` signals Phase B to renderers
 
@@ -134,7 +134,7 @@ Each episode has two phases:
 | Top-left | Carry Time Per Episode (s) | Blue | All episodes |
 | Top-right | Breadcrumbs Reached Per Episode | Brown/Amber | Tracked episodes; amber step line = all-time best |
 | Bottom-left | Avg Car Speed Per Episode (uu/s) | Purple | In-memory only, resets on restart |
-| Bottom-right | Wall Approach Penalty Per Episode | Teal | Tracked episodes |
+| Bottom-right | Boost & Flips Per Episode | Orange + Teal | Dual y-axis: boost used (left/orange) and direction flips (right/teal) |
 
 All charts show 50-episode rolling mean with 5th/95th percentile bands, compressed to at most 420 plotted bins.
 
@@ -148,7 +148,7 @@ A GIF is saved to `artifacts/periodic_p95/` **only when a new all-time breadcrum
 - Direction flips and near-wall carry seconds are logged to CSV but not shown on the dashboard
 
 ### Worker metrics serialization note
-`_collect_metrics` returns two arrays: a fixed 20-float metric array and a fixed-size crumb buffer (`1 + MAX_TRACKED_CRUMBS * 2 = 21` floats). The crumb buffer is always the same size so that `rlgym_ppo`'s `shm_view` (shared memory, only reallocated on agent-count change) is never overrun by a growing array.
+`_collect_metrics` returns two arrays: a fixed 21-float metric array and a fixed-size crumb buffer (`1 + MAX_TRACKED_CRUMBS * 2 = 21` floats). The 21st element is `boost_amount` (current boost level); per-step consumption is summed in the consumer. The crumb buffer is always the same size so that `rlgym_ppo`'s `shm_view` (shared memory, only reallocated on agent-count change) is never overrun by a growing array.
 
 **Important**: `env.reset()` is called by rlgym_ppo workers *before* `collect_metrics(info["state"])` on terminal steps. This clears module-level globals (`REACHED_BREADCRUMB_POSITIONS`, `CURRENT_LOOP_STATE`). To work around this:
 - Reached crumb positions are tracked in `_consume_metric` by detecting when `breadcrumbs_reached` count increases (car position recorded at that step), rather than reading the global.

@@ -388,8 +388,6 @@ class DribbleDashboard:
              PLOT_PADDING + chart_w + chart_gap_x, top_y),
             ("avg_speed", "Avg Car Speed Per Episode (uu/s)", "#7c3aed", "Tracked Episode",
              PLOT_PADDING, top_y + chart_h + chart_gap_y),
-            ("wall_approach_penalty", "Wall Approach Penalty Per Episode", "#0891b2", "Tracked Episode",
-             PLOT_PADDING + chart_w + chart_gap_x, top_y + chart_h + chart_gap_y),
         ]
         for key, title, color, x_prefix, x0, y0 in chart_specs:
             self._draw_plot(
@@ -397,6 +395,19 @@ class DribbleDashboard:
                 spec=plot_data.get(key, {}),
                 title=title, point_color=color, x_label_prefix=x_prefix,
             )
+        # Bottom-right: dual-axis boost used (left/orange) + direction flips (right/teal)
+        dual_x0 = PLOT_PADDING + chart_w + chart_gap_x
+        dual_y0 = top_y + chart_h + chart_gap_y
+        self._draw_dual_plot(
+            x0=dual_x0, y0=dual_y0, width=chart_w, height=chart_h,
+            spec1=plot_data.get("boost_used", {}),
+            spec2=plot_data.get("direction_flips_rolling", {}),
+            title="Boost & Flips Per Episode",
+            color1="#f97316",
+            color2="#0891b2",
+            label1="boost",
+            label2="flips",
+        )
 
         minimap_x = self.plot_width - minimap_width
         minimap_y = top_y
@@ -591,6 +602,114 @@ class DribbleDashboard:
             self.canvas.create_line(x1 - 47, base_y, x1 - 27, base_y, fill=legend_color, width=2, dash=(6, 6))
             self.canvas.create_text(x1 - 23, base_y, anchor="w", text="95th", fill=legend_color, font=LEGEND_FONT)
 
+    def _draw_dual_plot(self, x0, y0, width, height, spec1, spec2, title, color1, color2, label1, label2):
+        """Dual-axis chart: spec1 (mean+bands) on left axis, spec2 (mean only) on right axis."""
+        x1 = x0 + width
+        y1 = y0 + height
+        self.canvas.create_rectangle(x0, y0, x1, y1, outline="#9ca3af", width=2)
+        self.canvas.create_text(x0, y0 - 16, anchor="w", text=title, fill="#111827", font=TITLE_FONT)
+
+        mean1 = spec1.get("mean", [])
+        p05_1 = spec1.get("p05", [])
+        p95_1 = spec1.get("p95", [])
+        mean2 = spec2.get("mean", [])
+        x_end_label = spec1.get("x_end_label") or spec2.get("x_end_label")
+
+        if not mean1 and not mean2:
+            self.canvas.create_text(
+                x0 + width / 2, y0 + height / 2,
+                text="Waiting for data...", fill="#6b7280", font=("Helvetica", 11),
+            )
+            return
+
+        target_points = max(60, min(MAX_RENDER_POINTS, int(width)))
+
+        # Series 1 (left axis)
+        if mean1:
+            plot_x1, plot_m1 = _compress_plot_series(mean1, target_points)
+            _, plot_l1 = _compress_plot_series(p05_1, target_points) if p05_1 else (plot_x1, plot_m1.copy())
+            _, plot_h1 = _compress_plot_series(p95_1, target_points) if p95_1 else (plot_x1, plot_m1.copy())
+            min1 = float(min(float(plot_l1.min()), float(plot_m1.min()), float(plot_h1.min())))
+            max1 = float(max(float(plot_l1.max()), float(plot_m1.max()), float(plot_h1.max())))
+            if max1 - min1 < 1e-6:
+                max1 = min1 + 1.0
+            n_ref1 = max(len(mean1) - 1, 1)
+        else:
+            plot_x1 = plot_m1 = plot_l1 = plot_h1 = np.empty(0)
+            min1, max1, n_ref1 = 0.0, 1.0, 1
+
+        # Series 2 (right axis)
+        if mean2:
+            plot_x2, plot_m2 = _compress_plot_series(mean2, target_points)
+            min2 = float(plot_m2.min())
+            max2 = float(plot_m2.max())
+            if max2 - min2 < 1e-6:
+                max2 = min2 + 1.0
+            n_ref2 = max(len(mean2) - 1, 1)
+        else:
+            plot_x2 = plot_m2 = np.empty(0)
+            min2, max2, n_ref2 = 0.0, 1.0, 1
+
+        # Grid lines + left axis labels
+        for tick in range(5):
+            frac = tick / 4
+            y = y1 - frac * height
+            self.canvas.create_line(x0, y, x1, y, fill="#e5e7eb")
+            self.canvas.create_text(
+                x0 - 8, y, anchor="e",
+                text=f"{min1 + frac * (max1 - min1):.0f}",
+                fill=color1, font=AXIS_FONT,
+            )
+            if mean2:
+                self.canvas.create_text(
+                    x1 + 8, y, anchor="w",
+                    text=f"{min2 + frac * (max2 - min2):.1f}",
+                    fill=color2, font=AXIS_FONT,
+                )
+
+        # X-axis labels
+        self.canvas.create_text(x0, y1 + 14, anchor="w", text="Tracked Episode 1", fill="#6b7280", font=AXIS_FONT)
+        end_val = len(mean1 or mean2) if x_end_label is None else x_end_label
+        self.canvas.create_text(x1, y1 + 14, anchor="e", text=f"Tracked Episode {end_val}", fill="#6b7280", font=AXIS_FONT)
+
+        # Legend
+        light1 = _lighten_color(color1)
+        base_y = y0 - 14
+        self.canvas.create_line(x1 - 215, base_y, x1 - 195, base_y, fill=color1, width=3)
+        self.canvas.create_text(x1 - 191, base_y, anchor="w", text=label1, fill=color1, font=LEGEND_FONT)
+        self.canvas.create_line(x1 - 153, base_y, x1 - 133, base_y, fill=light1, width=2, dash=(6, 6))
+        self.canvas.create_text(x1 - 129, base_y, anchor="w", text="5/95th", fill=light1, font=LEGEND_FONT)
+        self.canvas.create_line(x1 - 70, base_y, x1 - 50, base_y, fill=color2, width=3)
+        self.canvas.create_text(x1 - 46, base_y, anchor="w", text=label2, fill=color2, font=LEGEND_FONT)
+
+        # Draw series 1: bands + mean (left scale)
+        if plot_m1.size >= 2:
+            if plot_l1.size >= 2:
+                pts = []
+                for xv, v in zip(plot_x1, plot_l1):
+                    pts.extend([x0 + (float(xv) / n_ref1) * width,
+                                 y1 - ((float(v) - min1) / (max1 - min1)) * height])
+                self.canvas.create_line(*pts, fill=light1, width=2, dash=(6, 6), smooth=True)
+            if plot_h1.size >= 2:
+                pts = []
+                for xv, v in zip(plot_x1, plot_h1):
+                    pts.extend([x0 + (float(xv) / n_ref1) * width,
+                                 y1 - ((float(v) - min1) / (max1 - min1)) * height])
+                self.canvas.create_line(*pts, fill=light1, width=2, dash=(6, 6), smooth=True)
+            pts = []
+            for xv, v in zip(plot_x1, plot_m1):
+                pts.extend([x0 + (float(xv) / n_ref1) * width,
+                             y1 - ((float(v) - min1) / (max1 - min1)) * height])
+            self.canvas.create_line(*pts, fill=color1, width=3, smooth=True)
+
+        # Draw series 2: mean only (right scale)
+        if plot_m2.size >= 2:
+            pts = []
+            for xv, v in zip(plot_x2, plot_m2):
+                pts.extend([x0 + (float(xv) / n_ref2) * width,
+                             y1 - ((float(v) - min2) / (max2 - min2)) * height])
+            self.canvas.create_line(*pts, fill=color2, width=3, smooth=True)
+
 
 class DribbleMetricsLogger:
     def __init__(self, dashboard_update_seconds=1.0):
@@ -636,6 +755,13 @@ class DribbleMetricsLogger:
         self.avg_speed_rolling = []
         self.avg_speed_p05 = []
         self.avg_speed_p95 = []
+        # Boost consumed per episode — in-memory only, not persisted
+        self.boost_used = []
+        self.boost_used_rolling = []
+        self.boost_used_p05 = []
+        self.boost_used_p95 = []
+        # Rolling mean of direction_flips (for dual chart) — in-memory only
+        self.direction_flips_rolling = _rolling_average(self.direction_flips, ROLLING_WINDOW)
         self.avg_reward_p05 = _rolling_percentile(self.avg_reward, ROLLING_WINDOW, 5)
         self.avg_reward_p95 = _rolling_percentile(self.avg_reward, ROLLING_WINDOW, 95)
         self.wall_approach_penalty_rolling = _rolling_average(self.wall_approach_penalty, ROLLING_WINDOW)
@@ -717,6 +843,11 @@ class DribbleMetricsLogger:
         state["avg_speed_rolling"] = []
         state["avg_speed_p05"] = []
         state["avg_speed_p95"] = []
+        state["boost_used"] = []
+        state["boost_used_rolling"] = []
+        state["boost_used_p05"] = []
+        state["boost_used_p95"] = []
+        state["direction_flips_rolling"] = []
         return state
 
     def __setstate__(self, state):
@@ -739,7 +870,7 @@ class DribbleMetricsLogger:
             self.worker_pid = os.getpid()
 
         if not game_state.cars:
-            return [np.zeros(19, dtype=np.float32)]
+            return [np.zeros(21, dtype=np.float32)]
 
         car = next(iter(game_state.cars.values()))
         _, _, _, carry_quality = get_dribble_alignment(car, game_state.ball.position)
@@ -777,13 +908,14 @@ class DribbleMetricsLogger:
         near_wall_flag = 1.0 if carrying > 0.5 and near_wall_warning_score(car.physics.position[:2]) > 0.0 else 0.0
 
         car_speed_xy = float(np.linalg.norm(car.physics.linear_velocity[:2]))
+        boost_amount = float(car.boost_amount)
 
-        # Metric array layout (20 elements):
+        # Metric array layout (21 elements):
         # 0: worker_pid, 1: tick_count, 2: car_x, 3: car_y, 4: heading,
         # 5: ball_x, 6: ball_y, 7: carrying, 8: turn_direction,
         # 9: breadcrumbs_reached, 10: direction_flips, 11: wall_approach_penalty,
         # 12: near_wall_flag, 13: target_x, 14: target_y, 15: has_target,
-        # 16: loop_x, 17: loop_y, 18: episode_reward_sum, 19: car_speed_xy
+        # 16: loop_x, 17: loop_y, 18: episode_reward_sum, 19: car_speed_xy, 20: boost_amount
         metric = np.array(
             [
                 float(self.worker_pid),
@@ -806,6 +938,7 @@ class DribbleMetricsLogger:
                 loop_y,
                 episode_reward_sum,
                 car_speed_xy,
+                boost_amount,
             ],
             dtype=np.float32,
         )
@@ -828,7 +961,7 @@ class DribbleMetricsLogger:
             if not metrics_arrays:
                 continue
             metric = np.asarray(metrics_arrays[0], dtype=np.float32)
-            if metric.size != 20:
+            if metric.size != 21:
                 continue
             reached_crumbs = []
             if len(metrics_arrays) > 1:
@@ -893,11 +1026,14 @@ class DribbleMetricsLogger:
                 "markers": tracked_markers,
                 "x_end_label": tracked_count,
             },
-            "wall_approach_penalty": {
-                "mean": self.wall_approach_penalty_rolling,
-                "p05": self.wall_approach_penalty_p05,
-                "p95": self.wall_approach_penalty_p95,
-                "markers": tracked_markers,
+            "boost_used": {
+                "mean": self.boost_used_rolling,
+                "p05": self.boost_used_p05,
+                "p95": self.boost_used_p95,
+                "x_end_label": tracked_count,
+            },
+            "direction_flips_rolling": {
+                "mean": self.direction_flips_rolling,
                 "x_end_label": tracked_count,
             },
         }
@@ -920,6 +1056,7 @@ class DribbleMetricsLogger:
         loop_y = float(metric[17])
         episode_reward_sum = float(metric[18])
         car_speed_xy = float(metric[19])
+        car_boost = float(metric[20])
 
         state = self.process_state.get(pid)
         if state is None:
@@ -930,6 +1067,8 @@ class DribbleMetricsLogger:
                 "total_steps": 1,
                 "distance": 0.0,
                 "speed_sum": car_speed_xy,
+                "boost_consumed": 0.0,
+                "last_boost": car_boost,
                 "breadcrumbs_reached": breadcrumbs_reached,
                 "direction_flips": direction_flips,
                 "episode_reward_sum": episode_reward_sum,
@@ -956,6 +1095,8 @@ class DribbleMetricsLogger:
             state["wall_approach_penalty"] = wall_approach_penalty
             state["near_wall_carry_steps"] = 1 if carrying and near_wall_flag else 0
             state["speed_sum"] = car_speed_xy
+            state["boost_consumed"] = 0.0
+            state["last_boost"] = car_boost
             state["crumb_positions"] = []
             state["frames"] = [self._build_episode_frame(
                 position, current_heading, ball_position, target_position, has_target, loop_x, loop_y,
@@ -974,6 +1115,9 @@ class DribbleMetricsLogger:
         state["carry_steps"] += 1 if carrying else 0
         state["total_steps"] = state.get("total_steps", 0) + 1
         state["speed_sum"] = state.get("speed_sum", 0.0) + car_speed_xy
+        boost_consumed_step = max(0.0, state.get("last_boost", 100.0) - car_boost)
+        state["boost_consumed"] = state.get("boost_consumed", 0.0) + boost_consumed_step
+        state["last_boost"] = car_boost
         if carrying and near_wall_flag:
             state["near_wall_carry_steps"] += 1
         state["breadcrumbs_reached"] = max(state["breadcrumbs_reached"], breadcrumbs_reached)
@@ -999,6 +1143,7 @@ class DribbleMetricsLogger:
         avg_reward = state["episode_reward_sum"] / total_steps
         carry_rate = state["carry_steps"] / total_steps
         avg_speed = state.get("speed_sum", 0.0) / total_steps
+        boost_used = state.get("boost_consumed", 0.0)
         wall_approach_penalty = state["wall_approach_penalty"]
         near_wall_carry_seconds = state["near_wall_carry_steps"] / DECISIONS_PER_SECOND
         self.episode_counter += 1
@@ -1015,6 +1160,8 @@ class DribbleMetricsLogger:
             breadcrumbs_reached,
         )
         self.direction_flips.append(direction_flips)
+        window_flips = self.direction_flips[-ROLLING_WINDOW:]
+        self.direction_flips_rolling.append(float(np.mean(window_flips)))
         _append_rolling_stats(
             self.avg_reward,
             self.avg_reward_rolling,
@@ -1035,6 +1182,13 @@ class DribbleMetricsLogger:
             self.avg_speed_p05,
             self.avg_speed_p95,
             avg_speed,
+        )
+        _append_rolling_stats(
+            self.boost_used,
+            self.boost_used_rolling,
+            self.boost_used_p05,
+            self.boost_used_p95,
+            boost_used,
         )
         _append_rolling_stats(
             self.wall_approach_penalty,
