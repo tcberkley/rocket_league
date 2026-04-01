@@ -11,7 +11,7 @@ from learner import (
     DEFAULT_COOLDOWN_SECONDS,
     DEFAULT_TIMESTEP_LIMIT,
     DEFAULT_TRAIN_SEGMENT_SECONDS,
-    migrate_dribble_waypoint_obs,
+    migrate_dribble_carry_quality_obs,
     prepare_runtime_locale,
     resolve_checkpoint_folder,
     run_learner,
@@ -360,7 +360,7 @@ def main():
             train_segment_seconds=args.train_segment_hours * 3600,
             cooldown_seconds=args.cooldown_minutes * 60,
             metrics_logger=metrics_logger,
-            checkpoint_migrate_fn=migrate_dribble_waypoint_obs if args.scenario == "dribble" else None,
+            checkpoint_migrate_fn=migrate_dribble_carry_quality_obs if args.scenario == "dribble" else None,
         )
         return
 

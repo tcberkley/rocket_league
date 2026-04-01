@@ -8,7 +8,7 @@ from rlgym.rocket_league import common_values
 from rlgym.rocket_league.api import GameState
 from rlgym.rocket_league.obs_builders import DefaultObs
 
-DRIBBLE_EPISODE_SECONDS = 20
+DRIBBLE_EPISODE_SECONDS = 30
 DRIBBLE_TICK_SKIP = 8
 DECISIONS_PER_SECOND = common_values.TICKS_PER_SECOND / DRIBBLE_TICK_SKIP
 
@@ -33,6 +33,12 @@ SPEED_COMFORT_CENTER = 450.0   # uu/s — ideal dribble speed; peak of the comfo
 SPEED_COMFORT_SIGMA = 350.0    # Gaussian half-width; ~700 uu/s yields ~75% of peak
 SPEED_COMFORT_SCALE = 0.10     # per-step reward at peak (same weight as carry quality)
 CARRY_THRESHOLD = 0.25
+
+BOOST_CONSERVATION_SCALE = 0.03  # per-step reward at full boost while carrying
+BOOST_PICKUP_REWARD = 0.10       # one-time bonus when a pad is collected
+# Threshold to detect a pad pickup: boost increase > expected max consumption per step.
+# At boost_consumption=0.5: 0.5 * 33.3 * (8/120) ≈ 1.1 boost/step, so 3.0 is a safe floor.
+BOOST_PICKUP_DETECT_THRESHOLD = 3.0
 
 GOAL_MOUTH_X_LIMIT = common_values.GOAL_CENTER_TO_POST + 140.0
 GOAL_MOUTH_Y_LIMIT = common_values.BACK_WALL_Y - 120.0
@@ -111,6 +117,8 @@ class DribbleStartMutator(StateMutator[GameState]):
         target_xy = tangent_point.copy()
         target_angle = spawn_angle
 
+        state.config.boost_consumption = 0.5  # halve drain; pads effectively give more
+
         for index, car in enumerate(state.cars.values()):
             car.physics.position = np.array([spawn_xy[0], spawn_xy[1], 17.0], dtype=np.float32)
             car.physics.linear_velocity = forward * car_speed  # along exact tangent
@@ -187,24 +195,27 @@ class BallDroppedCondition(DoneCondition[AgentID, GameState]):
         return {agent: done for agent in agents}
 
 
-N_WAYPOINT_OBS = 4  # dx_norm, dy_norm, bearing_cos, bearing_sin appended to DefaultObs
+N_WAYPOINT_OBS = 4  # dx_norm, dy_norm, bearing_cos, bearing_sin
+N_EXTRA_OBS = 5    # waypoint (4) + carry_quality (1)
 
 
 class DribbleObs(DefaultObs):
     """
-    DefaultObs extended with 4 relative waypoint features appended at the end:
+    DefaultObs extended with 5 extra features appended at the end:
       - dx_norm, dy_norm: waypoint position relative to car, normalised by BACK_NET_Y
       - bearing_cos, bearing_sin: how directly ahead the waypoint is (dot/cross with car forward)
-    All four are zero when no waypoint is active.
+      - carry_quality: pre-computed hood-alignment score in [0, 1]
+    All waypoint features are zero when no waypoint is active.
     """
 
     def get_obs_space(self, agent):
         obs_type, size = super().get_obs_space(agent)
-        return obs_type, size + N_WAYPOINT_OBS
+        return obs_type, size + N_EXTRA_OBS
 
     def build_obs(self, agents, state, shared_info):
         base_obs = super().build_obs(agents, state, shared_info)
         turn_target = shared_info.get("dribble_turn_target_xy")
+        ball_pos = state.ball.position
         for agent in agents:
             car = state.cars[agent]
             if turn_target is not None:
@@ -219,8 +230,11 @@ class DribbleObs(DefaultObs):
                 bearing_sin = float(fwd[0] * float(dir_xy[1]) - fwd[1] * float(dir_xy[0]))
             else:
                 dx_norm = dy_norm = bearing_cos = bearing_sin = 0.0
-            waypoint_feats = np.array([dx_norm, dy_norm, bearing_cos, bearing_sin], dtype=np.float32)
-            base_obs[agent] = np.concatenate([base_obs[agent], waypoint_feats])
+            _, _, _, carry_quality = get_dribble_alignment(car, ball_pos)
+            extra_feats = np.array(
+                [dx_norm, dy_norm, bearing_cos, bearing_sin, carry_quality], dtype=np.float32
+            )
+            base_obs[agent] = np.concatenate([base_obs[agent], extra_feats])
         return base_obs
 
 
@@ -233,11 +247,13 @@ class DribbleCarryReward(RewardFunction[AgentID, GameState, float]):
     def __init__(self):
         self.prev_positions: Dict[AgentID, np.ndarray] = {}
         self.prev_target_distances: Dict[AgentID, float] = {}
+        self.prev_boost: Dict[AgentID, float] = {}
         self.rng = np.random.default_rng()
 
     def reset(self, agents: List[AgentID], initial_state: GameState, shared_info: Dict[str, Any]) -> None:
         self.prev_positions = {}
         self.prev_target_distances = {}
+        self.prev_boost = {agent: initial_state.cars[agent].boost_amount for agent in agents}
 
         turn_target = shared_info.get("dribble_turn_target_xy")
         for agent in agents:
@@ -286,10 +302,20 @@ class DribbleCarryReward(RewardFunction[AgentID, GameState, float]):
                 reward -= WALL_PENALTY_SCALE * carry_quality * wall_pressure
                 reward -= CORNER_PENALTY_SCALE * carry_quality * corner_pressure
                 reward -= WALL_APPROACH_PENALTY_SCALE * carry_quality * wall_approach
+
+                # 5. Boost conservation: reward for keeping boost high while carrying
+                reward += BOOST_CONSERVATION_SCALE * carry_quality * (car.boost_amount / 100.0)
             else:
                 self.prev_target_distances.pop(agent, None)
 
-            # 4. Terminal penalty
+            # 6. Boost pickup: one-time bonus when a pad is collected
+            boost_delta = car.boost_amount - self.prev_boost.get(agent, car.boost_amount)
+            if boost_delta > BOOST_PICKUP_DETECT_THRESHOLD:
+                reward += BOOST_PICKUP_REWARD
+
+            self.prev_boost[agent] = car.boost_amount
+
+            # 7. Terminal penalty
             if is_terminated.get(agent, False) or is_truncated.get(agent, False):
                 reward -= 1.0
 
@@ -377,8 +403,10 @@ class DribbleCarryReward(RewardFunction[AgentID, GameState, float]):
                     "episode_reward_sum": shared_info.get("dribble_episode_reward_sum", 0.0),
                 })
             else:
-                # Phase B: random field waypoints
-                next_target_xy = build_random_field_target(car_pos, self.rng)
+                # Phase B: random field waypoints, biased toward car's forward arc
+                next_target_xy = build_random_field_target(
+                    car_pos, self.rng, car_forward_xy=car.physics.forward[:2]
+                )
                 shared_info["dribble_turn_target_xy"] = next_target_xy
                 shared_info["dribble_waypoint_index"] = next_waypoint_index
                 shared_info["dribble_breadcrumbs_reached"] = breadcrumbs_reached
@@ -548,9 +576,16 @@ def breadcrumb_type_for_index(breadcrumb_index: int) -> str:
     return _SCHEDULE.get(breadcrumb_index, "moderate")
 
 
+# Minimum forward-bearing dot product for Phase B targets.
+# dot(to_target, car_forward) > threshold filters out waypoints behind/beside the car.
+# 0.0 = within 90° (hemisphere ahead); -0.5 = within 120°; -1.0 = unrestricted.
+RANDOM_TARGET_MIN_FORWARD_DOT = -0.3  # ~107° forward arc — avoids U-turns, allows wide curves
+
+
 def build_random_field_target(
     car_pos_xy: np.ndarray,
     rng,
+    car_forward_xy: Optional[np.ndarray] = None,
     min_distance: float = RANDOM_TARGET_MIN_DISTANCE,
     max_distance: float = RANDOM_TARGET_MAX_DISTANCE,
     safe_x: float = RANDOM_FIELD_SAFE_X,
@@ -558,23 +593,38 @@ def build_random_field_target(
 ) -> np.ndarray:
     """Pick a random field point within safe margins at a reasonable distance from the car.
 
+    When car_forward_xy is provided, only targets within a forward arc
+    (dot product > RANDOM_TARGET_MIN_FORWARD_DOT) are accepted, preventing
+    waypoints that require a U-turn while dribbling.
+
     Uses rejection sampling with up to RANDOM_TARGET_MAX_ATTEMPTS tries, then falls back
-    to a clamped directional point.
+    to a heading-biased directional point.
     """
     car_pos_xy = np.asarray(car_pos_xy, dtype=np.float32)
+    forward = safe_normalize(np.asarray(car_forward_xy, dtype=np.float32)) if car_forward_xy is not None else None
+
     for _ in range(RANDOM_TARGET_MAX_ATTEMPTS):
         x = float(rng.uniform(-safe_x, safe_x))
         y = float(rng.uniform(-safe_y, safe_y))
         target = np.array([x, y], dtype=np.float32)
-        distance = float(np.linalg.norm(target - car_pos_xy))
+        diff = target - car_pos_xy
+        distance = float(np.linalg.norm(diff))
         if distance < min_distance or distance > max_distance:
             continue
         if not breadcrumb_segment_is_safe(car_pos_xy, target, safe_x, safe_y):
             continue
+        if forward is not None:
+            bearing = float(np.dot(safe_normalize(diff), forward))
+            if bearing < RANDOM_TARGET_MIN_FORWARD_DOT:
+                continue
         return target
 
-    # Fallback: fixed distance in a random direction, clamped to safe area
-    angle = float(rng.uniform(-np.pi, np.pi))
+    # Fallback: pick an angle biased toward the car's forward direction
+    if forward is not None:
+        base_angle = float(np.arctan2(float(forward[1]), float(forward[0])))
+        angle = float(rng.uniform(base_angle - np.pi * 0.6, base_angle + np.pi * 0.6))
+    else:
+        angle = float(rng.uniform(-np.pi, np.pi))
     fallback = car_pos_xy + min_distance * np.array([np.cos(angle), np.sin(angle)], dtype=np.float32)
     fallback[0] = float(np.clip(fallback[0], -safe_x, safe_x))
     fallback[1] = float(np.clip(fallback[1], -safe_y, safe_y))

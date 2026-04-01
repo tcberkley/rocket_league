@@ -162,3 +162,7 @@ A GIF is saved to `artifacts/periodic_p95/` **only when a new all-time breadcrum
 - PyTorch MPS backend for GPU acceleration (`device="auto"` in `learner.py`)
 - Set `PYTORCH_ENABLE_MPS_FALLBACK=1` for unsupported MPS ops; or change to `device="cpu"` if MPS causes issues
 - Tune `n_proc` in `learner.py`: 4 for M1/M2, 6-8 for Pro/Max/Ultra
+
+## TODO
+
+- ~~Add boost pad weights to reward shaping~~ Done: boost_consumption=0.5, conservation reward (0.03/step), pickup bonus (0.10)
