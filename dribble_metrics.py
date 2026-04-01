@@ -1082,7 +1082,7 @@ class DribbleMetricsLogger:
                 "mean": self.direction_flips_rolling,
                 "x_end_label": tracked_count,
             },
-            "crumb_count_hist": dict(self.crumb_count_hist),
+            "crumb_count_hist": dict(Counter(int(v) for v in self.breadcrumbs_reached[-100_000:])),
         }
 
     def _consume_metric(self, metric, reached_crumbs=()):
