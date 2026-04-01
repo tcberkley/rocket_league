@@ -8,7 +8,7 @@ from rlgym.rocket_league import common_values
 from rlgym.rocket_league.api import GameState
 from rlgym.rocket_league.obs_builders import DefaultObs
 
-DRIBBLE_EPISODE_SECONDS = 60
+DRIBBLE_EPISODE_SECONDS = 180
 DRIBBLE_TICK_SKIP = 8
 DECISIONS_PER_SECOND = common_values.TICKS_PER_SECOND / DRIBBLE_TICK_SKIP
 
