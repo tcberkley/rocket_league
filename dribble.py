@@ -37,8 +37,8 @@ CARRY_THRESHOLD = 0.25
 BOOST_CONSERVATION_SCALE = 0.03  # per-step reward at full boost while carrying
 BOOST_PICKUP_REWARD = 0.10       # one-time bonus when a pad is collected
 # Threshold to detect a pad pickup: boost increase > expected max consumption per step.
-# At boost_consumption=0.5: 0.5 * 33.3 * (8/120) ≈ 1.1 boost/step, so 3.0 is a safe floor.
-BOOST_PICKUP_DETECT_THRESHOLD = 3.0
+# At boost_consumption=1.0: 33.3 * (8/120) ≈ 2.2 boost/step, so 4.0 is a safe floor.
+BOOST_PICKUP_DETECT_THRESHOLD = 4.0
 
 GOAL_MOUTH_X_LIMIT = common_values.GOAL_CENTER_TO_POST + 140.0
 GOAL_MOUTH_Y_LIMIT = common_values.BACK_WALL_Y - 120.0
@@ -117,7 +117,7 @@ class DribbleStartMutator(StateMutator[GameState]):
         target_xy = tangent_point.copy()
         target_angle = spawn_angle
 
-        state.config.boost_consumption = 0.5  # halve drain; pads effectively give more
+        state.config.boost_consumption = 1.0  # full drain; model must actively manage boost
 
         for index, car in enumerate(state.cars.values()):
             car.physics.position = np.array([spawn_xy[0], spawn_xy[1], 17.0], dtype=np.float32)
