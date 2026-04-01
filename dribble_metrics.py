@@ -3,7 +3,7 @@ import json
 import os
 import time
 import tkinter as tk
-from collections import deque
+from collections import Counter, deque
 from pathlib import Path
 
 import numpy as np
@@ -411,8 +411,13 @@ class DribbleDashboard:
 
         minimap_x = self.plot_width - minimap_width
         minimap_y = top_y
-        minimap_h = available_height
+        crumb_panel_h = 175
+        minimap_h = available_height - crumb_panel_h - 10
         self._render_minimap(minimap_frames, minimap_x, minimap_y, minimap_width, minimap_h)
+        self._render_crumb_counts(
+            plot_data.get("crumb_count_hist", {}),
+            minimap_x, minimap_y + minimap_h + 10, minimap_width, crumb_panel_h,
+        )
 
         try:
             self.root.update_idletasks()
@@ -437,6 +442,46 @@ class DribbleDashboard:
         )
         self._minimap_photo = ImageTk.PhotoImage(image)
         self.canvas.create_image(x0, y0, anchor="nw", image=self._minimap_photo)
+
+    def _render_crumb_counts(self, crumb_hist, x0, y0, width, height):
+        x1 = x0 + width
+        y1 = y0 + height
+        self.canvas.create_rectangle(x0, y0, x1, y1, outline="#9ca3af", width=2)
+        self.canvas.create_text(
+            x0 + width / 2, y0 + 14,
+            anchor="center", text="Breadcrumb Counts", fill="#111827", font=TITLE_FONT,
+        )
+        if not crumb_hist:
+            self.canvas.create_text(
+                x0 + width / 2, y0 + height / 2,
+                text="No data yet", fill="#6b7280", font=AXIS_FONT,
+            )
+            return
+
+        total = sum(crumb_hist.values())
+        max_crumb = max(crumb_hist.keys()) if crumb_hist else 0
+        rows = [(k, crumb_hist.get(k, 0)) for k in range(max_crumb + 1)]
+
+        row_h = min(16, (height - 30) / max(len(rows), 1))
+        col_crumb = x0 + 12
+        col_count = x0 + width * 0.42
+        col_pct = x0 + width * 0.72
+        bar_x0 = x0 + width * 0.82
+        bar_x1 = x1 - 8
+        bar_max_w = bar_x1 - bar_x0
+        max_count = max(c for _, c in rows) if rows else 1
+
+        for i, (crumb, count) in enumerate(rows):
+            y = y0 + 28 + i * row_h
+            pct = count / total * 100 if total else 0.0
+            color = "#22c55e" if crumb >= 5 else ("#f59e0b" if crumb >= 3 else "#6b7280")
+            label = f"{crumb} crumb{'s' if crumb != 1 else ''}"
+            self.canvas.create_text(col_crumb, y, anchor="w", text=label, fill=color, font=AXIS_FONT)
+            self.canvas.create_text(col_count, y, anchor="w", text=f"{count:,}", fill="#374151", font=AXIS_FONT)
+            self.canvas.create_text(col_pct, y, anchor="w", text=f"{pct:.1f}%", fill="#374151", font=AXIS_FONT)
+            bar_w = int(bar_max_w * count / max_count)
+            if bar_w > 0:
+                self.canvas.create_rectangle(bar_x0, y - 5, bar_x0 + bar_w, y + 5, fill=color, outline="")
 
     def _draw_plot(self, x0, y0, width, height, spec, title, point_color, x_label_prefix):
         x1 = x0 + width
@@ -735,6 +780,7 @@ class DribbleMetricsLogger:
         self.wall_approach_penalty = phase4["wall_approach_penalty"]
         self.near_wall_carry_seconds = phase4["near_wall_carry_seconds"]
 
+        self.crumb_count_hist = Counter(int(v) for v in self.breadcrumbs_reached)
         self.breadcrumbs_reached_rolling = _rolling_average(self.breadcrumbs_reached, ROLLING_WINDOW)
         self.breadcrumbs_reached_p05 = _rolling_percentile(self.breadcrumbs_reached, ROLLING_WINDOW, 5)
         self.breadcrumbs_reached_p95 = _rolling_percentile(self.breadcrumbs_reached, ROLLING_WINDOW, 95)
@@ -1036,6 +1082,7 @@ class DribbleMetricsLogger:
                 "mean": self.direction_flips_rolling,
                 "x_end_label": tracked_count,
             },
+            "crumb_count_hist": dict(self.crumb_count_hist),
         }
 
     def _consume_metric(self, metric, reached_crumbs=()):
@@ -1198,6 +1245,7 @@ class DribbleMetricsLogger:
             wall_approach_penalty,
         )
         self.near_wall_carry_seconds.append(near_wall_carry_seconds)
+        self.crumb_count_hist[int(breadcrumbs_reached)] += 1
 
         with METRICS_CSV.open("a", newline="") as handle:
             writer = csv.writer(handle)
