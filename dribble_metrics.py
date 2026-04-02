@@ -414,9 +414,16 @@ class DribbleDashboard:
         crumb_panel_h = 175
         minimap_h = available_height - crumb_panel_h - 10
         self._render_minimap(minimap_frames, minimap_x, minimap_y, minimap_width, minimap_h)
+        panel_y = minimap_y + minimap_h + 10
+        hist_w = int(minimap_width * 0.58)
+        lb_w = minimap_width - hist_w - 4
         self._render_crumb_counts(
             plot_data.get("crumb_count_hist", {}),
-            minimap_x, minimap_y + minimap_h + 10, minimap_width, crumb_panel_h,
+            minimap_x, panel_y, hist_w, crumb_panel_h,
+        )
+        self._render_top_runs(
+            plot_data.get("top_runs", []),
+            minimap_x + hist_w + 4, panel_y, lb_w, crumb_panel_h,
         )
 
         try:
@@ -494,6 +501,41 @@ class DribbleDashboard:
         )
         self.canvas.create_line(chart_x0, chart_y0, chart_x0, chart_y1, fill="#e5e7eb")
         self.canvas.create_line(chart_x0, chart_y1, chart_x1, chart_y1, fill="#e5e7eb")
+
+    def _render_top_runs(self, top_runs, x0, y0, width, height):
+        x1 = x0 + width
+        y1 = y0 + height
+        self.canvas.create_rectangle(x0, y0, x1, y1, outline="#9ca3af", width=2)
+        self.canvas.create_text(
+            x0 + width / 2, y0 + 14,
+            anchor="center", text="Top 5 Runs", fill="#111827", font=TITLE_FONT,
+        )
+        if not top_runs:
+            self.canvas.create_text(
+                x0 + width / 2, y0 + height / 2,
+                text="No data yet", fill="#6b7280", font=AXIS_FONT,
+            )
+            return
+
+        row_h = (height - 30) / 5
+        medals = ["#f59e0b", "#9ca3af", "#b45309", "#6b7280", "#6b7280"]
+        for i, (crumbs, carry_s, episode) in enumerate(top_runs):
+            cy = y0 + 28 + i * row_h
+            color = medals[i]
+            mins, secs = divmod(int(carry_s), 60)
+            time_str = f"{mins}m {secs:02d}s" if mins else f"{secs}s"
+            self.canvas.create_text(
+                x0 + 10, cy, anchor="w",
+                text=f"#{i+1}", fill=color, font=("Helvetica", 9, "bold"),
+            )
+            self.canvas.create_text(
+                x0 + 30, cy, anchor="w",
+                text=f"{crumbs} crumbs", fill="#111827", font=AXIS_FONT,
+            )
+            self.canvas.create_text(
+                x0 + width - 8, cy, anchor="e",
+                text=time_str, fill="#6b7280", font=AXIS_FONT,
+            )
 
     def _draw_plot(self, x0, y0, width, height, spec, title, point_color, x_label_prefix):
         x1 = x0 + width
@@ -793,6 +835,13 @@ class DribbleMetricsLogger:
         self.near_wall_carry_seconds = phase4["near_wall_carry_seconds"]
 
         self.crumb_count_hist = Counter(int(v) for v in self.breadcrumbs_reached)
+        # Top-5 runs by (breadcrumbs DESC, carry_seconds DESC): list of (crumbs, carry_s, episode)
+        paired = sorted(
+            zip(self.breadcrumbs_reached, self.carry_seconds, self.phase4_episodes),
+            key=lambda x: (x[0], x[1]),
+            reverse=True,
+        )
+        self.top_runs = [(int(c), float(s), int(ep)) for c, s, ep in paired[:5]]
         self.breadcrumbs_reached_rolling = _rolling_average(self.breadcrumbs_reached, ROLLING_WINDOW)
         self.breadcrumbs_reached_p05 = _rolling_percentile(self.breadcrumbs_reached, ROLLING_WINDOW, 5)
         self.breadcrumbs_reached_p95 = _rolling_percentile(self.breadcrumbs_reached, ROLLING_WINDOW, 95)
@@ -893,6 +942,7 @@ class DribbleMetricsLogger:
         state["last_episode_frames"] = []
         state["cumulative_timesteps"] = 0
         state["breadcrumbs_max_series"] = []
+        state["top_runs"] = []
         state["carry_rate"] = []
         state["carry_rate_rolling"] = []
         state["carry_rate_p05"] = []
@@ -1095,6 +1145,7 @@ class DribbleMetricsLogger:
                 "x_end_label": tracked_count,
             },
             "crumb_count_hist": dict(Counter(int(v) for v in self.breadcrumbs_reached[-100_000:])),
+            "top_runs": list(self.top_runs),
         }
 
     def _consume_metric(self, metric, reached_crumbs=()):
@@ -1258,6 +1309,11 @@ class DribbleMetricsLogger:
         )
         self.near_wall_carry_seconds.append(near_wall_carry_seconds)
         self.crumb_count_hist[int(breadcrumbs_reached)] += 1
+        self.top_runs = sorted(
+            self.top_runs + [(int(breadcrumbs_reached), carry_seconds, self.episode_counter)],
+            key=lambda x: (x[0], x[1]),
+            reverse=True,
+        )[:5]
 
         with METRICS_CSV.open("a", newline="") as handle:
             writer = csv.writer(handle)
