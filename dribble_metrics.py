@@ -449,7 +449,7 @@ class DribbleDashboard:
         self.canvas.create_rectangle(x0, y0, x1, y1, outline="#9ca3af", width=2)
         self.canvas.create_text(
             x0 + width / 2, y0 + 14,
-            anchor="center", text="Breadcrumb Counts", fill="#111827", font=TITLE_FONT,
+            anchor="center", text="Breadcrumb Counts (last 100k)", fill="#111827", font=TITLE_FONT,
         )
         if not crumb_hist:
             self.canvas.create_text(
@@ -458,30 +458,42 @@ class DribbleDashboard:
             )
             return
 
-        total = sum(crumb_hist.values())
-        max_crumb = max(crumb_hist.keys()) if crumb_hist else 0
-        rows = [(k, crumb_hist.get(k, 0)) for k in range(max_crumb + 1)]
+        pad_l, pad_r, pad_top, pad_bot = 28, 12, 28, 22
+        chart_x0 = x0 + pad_l
+        chart_x1 = x1 - pad_r
+        chart_y0 = y0 + pad_top
+        chart_y1 = y1 - pad_bot
+        chart_w = chart_x1 - chart_x0
+        chart_h = chart_y1 - chart_y0
 
-        row_h = min(16, (height - 30) / max(len(rows), 1))
-        col_crumb = x0 + 12
-        col_count = x0 + width * 0.42
-        col_pct = x0 + width * 0.72
-        bar_x0 = x0 + width * 0.82
-        bar_x1 = x1 - 8
-        bar_max_w = bar_x1 - bar_x0
-        max_count = max(c for _, c in rows) if rows else 1
+        max_crumb = max(crumb_hist.keys())
+        bars = [(k, crumb_hist.get(k, 0)) for k in range(max_crumb + 1)]
+        n = len(bars)
+        max_count = max(c for _, c in bars) if bars else 1
+        bar_w = max(2, chart_w / n - 2)
+        gap = (chart_w - bar_w * n) / max(n - 1, 1)
 
-        for i, (crumb, count) in enumerate(rows):
-            y = y0 + 28 + i * row_h
-            pct = count / total * 100 if total else 0.0
+        for i, (crumb, count) in enumerate(bars):
+            bx = chart_x0 + i * (bar_w + gap)
+            bar_h = int(chart_h * count / max_count) if max_count > 0 else 0
+            by0 = chart_y1 - bar_h
             color = "#22c55e" if crumb >= 5 else ("#f59e0b" if crumb >= 3 else "#6b7280")
-            label = f"{crumb} crumb{'s' if crumb != 1 else ''}"
-            self.canvas.create_text(col_crumb, y, anchor="w", text=label, fill=color, font=AXIS_FONT)
-            self.canvas.create_text(col_count, y, anchor="w", text=f"{count:,}", fill="#374151", font=AXIS_FONT)
-            self.canvas.create_text(col_pct, y, anchor="w", text=f"{pct:.1f}%", fill="#374151", font=AXIS_FONT)
-            bar_w = int(bar_max_w * count / max_count)
-            if bar_w > 0:
-                self.canvas.create_rectangle(bar_x0, y - 5, bar_x0 + bar_w, y + 5, fill=color, outline="")
+            if bar_h > 0:
+                self.canvas.create_rectangle(bx, by0, bx + bar_w, chart_y1, fill=color, outline="")
+            # x-axis label — every 5 ticks to avoid crowding
+            if crumb % 5 == 0:
+                self.canvas.create_text(
+                    bx + bar_w / 2, chart_y1 + 4, anchor="n",
+                    text=str(crumb), fill="#6b7280", font=AXIS_FONT,
+                )
+
+        # y-axis: just label the max
+        self.canvas.create_text(
+            x0 + pad_l - 4, chart_y0, anchor="e",
+            text=f"{max_count:,}", fill="#6b7280", font=AXIS_FONT,
+        )
+        self.canvas.create_line(chart_x0, chart_y0, chart_x0, chart_y1, fill="#e5e7eb")
+        self.canvas.create_line(chart_x0, chart_y1, chart_x1, chart_y1, fill="#e5e7eb")
 
     def _draw_plot(self, x0, y0, width, height, spec, title, point_color, x_label_prefix):
         x1 = x0 + width
