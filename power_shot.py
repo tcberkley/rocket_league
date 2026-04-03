@@ -2,7 +2,7 @@
 Power Shot scenario: bot receives varied passes and is judged on shot speed into the opponent's goal.
 
 6-stage curriculum (per-worker thresholds; multiply by ~4 for global episode count):
-  Stage 0 (0–25k/w,  ~0–100k global):   ball 80–300 uu in front, near-stationary. Just touch and score.
+  Stage 0 (0–25k/w,  ~0–100k global):   slow ground ball 300–600 uu ahead, ±15°. Drive up and shoot.
   Stage 1 (25–50k/w, ~100–200k global): short rolling passes, ±25°.
   Stage 2 (50–75k/w, ~200–300k global): medium passes, ±45°, slight height.
   Stage 3 (75–100k/w,~300–400k global): longer arcing passes, ±70°.
@@ -55,17 +55,19 @@ GRAVITY = 650.0
 #   own_goal_pen      — penalty when bot scores in own goal
 # ---------------------------------------------------------------------------
 _CURRICULUM = [
-    # Stage 0: ~0–100k global — ball RIGHT in front, near-stationary. Just nudge it.
+    # Stage 0: ~0–100k global — slow ground ball 300–600 uu directly ahead. Drive up and shoot.
+    # d_min=300 keeps ball outside the 200 uu touch-detection radius at spawn.
+    # s_min=100 ensures ball speed stays > 50 uu/s (done threshold) until the car actually hits it.
     (25_000,
-     dict(angle=math.radians(10), h_min=93, h_max=93,  s_min=0,   s_max=30,   d_min=80,   d_max=250),
-     dict(ball_vel_w=6.0, approach_w=0.0, first_touch=3.0, subseq_touch=1.0,
-          goal_base=10.0, shot_speed_w=1.0, no_touch_pen=-0.1, own_goal_pen=-1.0)),
+     dict(angle=math.radians(15), h_min=93, h_max=93,  s_min=100, s_max=250,  d_min=300,  d_max=600),
+     dict(ball_vel_w=2.0, approach_w=1.5, first_touch=3.0, subseq_touch=1.0,
+          goal_base=8.0,  shot_speed_w=4.0, no_touch_pen=-0.5, own_goal_pen=-1.0)),
 
     # Stage 1: ~100–200k global — short rolls, ±25°.
     (50_000,
-     dict(angle=math.radians(25), h_min=93, h_max=93,  s_min=50,  s_max=350,  d_min=200,  d_max=800),
-     dict(ball_vel_w=4.0, approach_w=2.0, first_touch=2.0, subseq_touch=0.5,
-          goal_base=6.0,  shot_speed_w=2.0, no_touch_pen=-0.3, own_goal_pen=-2.0)),
+     dict(angle=math.radians(25), h_min=93, h_max=93,  s_min=100, s_max=400,  d_min=400,  d_max=1000),
+     dict(ball_vel_w=2.5, approach_w=2.0, first_touch=2.0, subseq_touch=0.5,
+          goal_base=6.0,  shot_speed_w=4.0, no_touch_pen=-0.4, own_goal_pen=-2.0)),
 
     # Stage 2: ~200–300k global — medium passes, ±45°, slight height.
     (75_000,
