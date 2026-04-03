@@ -270,8 +270,12 @@ class PowerShotObs:
     def reset(self, agents, initial_state, shared_info: dict) -> None:
         self._base_obs.reset(agents, initial_state, shared_info)
 
-    def build_obs(self, agent, state, shared_info: dict):
-        base = self._base_obs.build_obs(agent, state, shared_info)
+    def get_obs_space(self, agent):
+        obs_type, size = self._base_obs.get_obs_space(agent)
+        return obs_type, size + 3
+
+    def build_obs(self, agents, state, shared_info: dict):
+        base_obs = self._base_obs.build_obs(agents, state, shared_info)
         ball_pos = state.ball.position
         ball_vel = state.ball.linear_velocity
 
@@ -286,4 +290,6 @@ class PowerShotObs:
             ball_vel_toward_goal,
         ], dtype=np.float32)
 
-        return np.concatenate([base, extra])
+        for agent in agents:
+            base_obs[agent] = np.concatenate([base_obs[agent], extra])
+        return base_obs
