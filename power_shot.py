@@ -15,14 +15,6 @@ POWER_SHOT_EPISODE_SECONDS = 12
 POWER_SHOT_TICK_SKIP = 8
 POWER_SHOT_NO_TOUCH_TIMEOUT = 6
 
-# Ball spawn params
-BALL_SPAWN_SPEED_MIN = 500    # uu/s
-BALL_SPAWN_SPEED_MAX = 3000   # uu/s
-BALL_SPAWN_HEIGHT_MIN = 93    # uu (ground level)
-BALL_SPAWN_HEIGHT_MAX = 800   # uu
-BALL_SPAWN_DIST_MIN = 1500    # uu from car
-BALL_SPAWN_DIST_MAX = 4000    # uu from car
-
 # Car spawn params
 CAR_SPAWN_X_RANGE = 2500      # uu
 CAR_SPAWN_Y_MIN = -2000       # uu (blue side)
@@ -36,6 +28,28 @@ BALL_MAX_SPEED = 6000
 ORANGE_GOAL_Y = BACK_WALL_Y   # orange goal at +y
 GRAVITY = 650.0               # uu/s^2
 
+# ---------------------------------------------------------------------------
+# Curriculum
+# Each stage: (episodes_per_worker_threshold, spawn_params_dict)
+# With 4 workers, multiply by 4 to get global episode count.
+# Stage 0: 0–25k per worker (~100k global) — ground rolls, straight ahead
+# Stage 1: 25k–75k per worker (~100k–300k global) — widening arc, low bounces
+# Stage 2: 75k+ per worker (~300k+ global) — full chaos
+# ---------------------------------------------------------------------------
+_CURRICULUM = [
+    # threshold, angle_half_arc, height_min, height_max, speed_min, speed_max, dist_min, dist_max
+    (25_000,  math.radians(40),  93,  93,   200,  700,  600,  1800),
+    (75_000,  math.radians(90),  93, 300,   300, 1500,  800,  2800),
+    (None,    math.pi,           93, 800,   500, 3000, 1500,  4000),
+]
+
+
+def _get_curriculum_params(episode_count):
+    for threshold, *params in _CURRICULUM:
+        if threshold is None or episode_count < threshold:
+            return params
+    return _CURRICULUM[-1][1:]
+
 
 def _yaw_to_facing(yaw_rad):
     """Returns (x, y) unit vector for a given yaw angle."""
@@ -48,12 +62,22 @@ def _yaw_to_facing(yaw_rad):
 class PowerShotMutator:
     """
     Spawns a single blue car facing the orange goal (+y direction).
-    Ball is launched toward the car from a random angle/height/speed.
+    Ball spawn difficulty scales with episode count via a 3-stage curriculum:
+      Stage 0 (~0-100k global): ground rolls in front of car
+      Stage 1 (~100k-300k global): low bouncing passes, wider arc
+      Stage 2 (300k+): full chaos — any direction, height, speed
     """
 
+    def __init__(self):
+        self.episode_count = 0
+
     def apply(self, state, shared_info: dict) -> None:
-        from rlgym.rocket_league.api import PhysicsObject
         from rlgym.rocket_league import common_values
+
+        self.episode_count += 1
+        angle_half_arc, height_min, height_max, speed_min, speed_max, dist_min, dist_max = (
+            _get_curriculum_params(self.episode_count)
+        )
 
         # --- Car spawn ---
         car_x = random.uniform(-CAR_SPAWN_X_RANGE, CAR_SPAWN_X_RANGE)
@@ -63,44 +87,45 @@ class PowerShotMutator:
         # Face approximately toward orange goal (+y) with small yaw noise
         yaw_noise = random.uniform(-math.radians(15), math.radians(15))
         car_yaw = math.pi / 2 + yaw_noise  # pi/2 = facing +y
-        car_facing_x, car_facing_y = _yaw_to_facing(car_yaw)
 
         agent_id = list(state.cars.keys())[0]
         car = state.cars[agent_id]
         car.physics.position = np.array([car_x, car_y, car_z], dtype=np.float32)
         car.physics.linear_velocity = np.zeros(3, dtype=np.float32)
         car.physics.angular_velocity = np.zeros(3, dtype=np.float32)
-        # Euler angles: pitch=0, yaw, roll=0
         car.physics.euler_angles = np.array([0.0, car_yaw, 0.0], dtype=np.float32)
         car.boost_amount = random.uniform(50, 100) / 100.0
 
         # --- Ball spawn ---
-        # Pick a random direction and distance from the car
-        ball_angle = random.uniform(0, 2 * math.pi)
-        ball_dist = random.uniform(BALL_SPAWN_DIST_MIN, BALL_SPAWN_DIST_MAX)
+        # Angle sampled within arc in front of the car (relative to car yaw)
+        ball_angle = car_yaw + random.uniform(-angle_half_arc, angle_half_arc)
+        ball_dist = random.uniform(dist_min, dist_max)
         ball_x = np.clip(car_x + math.cos(ball_angle) * ball_dist, -SIDE_WALL_X + 200, SIDE_WALL_X - 200)
-        ball_z = random.uniform(BALL_SPAWN_HEIGHT_MIN, BALL_SPAWN_HEIGHT_MAX)
-
-        # Ball y: keep it within reasonable play area, not past the car toward opponent goal
-        ball_y_raw = car_y + math.sin(ball_angle) * ball_dist
-        ball_y = np.clip(ball_y_raw, -BACK_WALL_Y + 200, BACK_WALL_Y - 200)
+        ball_y = np.clip(car_y + math.sin(ball_angle) * ball_dist, -BACK_WALL_Y + 200, BACK_WALL_Y - 200)
+        ball_z = float(random.uniform(height_min, height_max))
 
         ball_pos = np.array([ball_x, ball_y, ball_z], dtype=np.float32)
 
-        # Launch ball toward the car with some arc
+        # Direction from ball toward car
         dx = car_x - ball_x
         dy = car_y - ball_y
-        dz = car_z - ball_z
         horiz_dist = math.sqrt(dx * dx + dy * dy) + 1e-6
-        speed = random.uniform(BALL_SPAWN_SPEED_MIN, BALL_SPAWN_SPEED_MAX)
-        horiz_speed = speed * math.cos(math.atan2(abs(dz), horiz_dist))
-        vx = horiz_speed * dx / horiz_dist
-        vy = horiz_speed * dy / horiz_dist
+        speed = random.uniform(speed_min, speed_max)
 
-        # Gravity compensation on z so ball arcs toward the car
-        time_of_flight = horiz_dist / (horiz_speed + 1e-6)
-        vz = dz / (time_of_flight + 1e-6) + 0.5 * GRAVITY * time_of_flight
-        # Cap total speed
+        if height_min == height_max == 93:
+            # Ground roll: purely horizontal, no arc
+            vx = speed * dx / horiz_dist
+            vy = speed * dy / horiz_dist
+            vz = 0.0
+        else:
+            # Arcing pass: gravity-compensated so ball reaches car position
+            dz = car_z - ball_z
+            horiz_speed = speed * math.cos(math.atan2(abs(dz), horiz_dist))
+            vx = horiz_speed * dx / horiz_dist
+            vy = horiz_speed * dy / horiz_dist
+            time_of_flight = horiz_dist / (horiz_speed + 1e-6)
+            vz = dz / (time_of_flight + 1e-6) + 0.5 * GRAVITY * time_of_flight
+
         vel = np.array([vx, vy, vz], dtype=np.float32)
         vel_magnitude = np.linalg.norm(vel)
         if vel_magnitude > BALL_MAX_SPEED:

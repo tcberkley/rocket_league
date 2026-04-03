@@ -39,11 +39,12 @@ BALL_MAX_SPEED = 6000.0
 ORANGE_GOAL_Y = BACK_WALL_Y
 GOAL_HALF_WIDTH = 892.755
 
-# Metric array layout (13 elements):
+# Metric array layout (15 elements):
 # 0: worker_pid, 1: tick_count, 2: car_x, 3: car_y, 4: heading,
 # 5: ball_x, 6: ball_y, 7: goal_scored, 8: scoring_team,
-# 9: ball_speed, 10: episode_reward_sum, 11: car_speed, 12: boost_amount
-METRIC_SIZE = 13
+# 9: ball_speed, 10: episode_reward_sum, 11: car_speed, 12: boost_amount,
+# 13: car_vel_x, 14: car_vel_y
+METRIC_SIZE = 15
 DECISIONS_PER_SECOND = 120.0 / 8  # tick_rate / tick_skip
 
 
@@ -118,6 +119,8 @@ def _load_csv_history():
         "shot_speed": [],        # ball speed at goal, 0 if no goal
         "goal_scored": [],       # 1.0 if blue goal, 0.0 otherwise
         "avg_reward": [],
+        "boost_used": [],
+        "direction_flips": [],
     }
     if not POWER_SHOT_METRICS_CSV.exists():
         return history
@@ -134,6 +137,8 @@ def _load_csv_history():
                 history["shot_speed"].append(float(row[2]))
                 history["goal_scored"].append(float(row[3]))
                 history["avg_reward"].append(float(row[4]) if len(row) > 4 else 0.0)
+                history["boost_used"].append(float(row[5]) if len(row) > 5 else 0.0)
+                history["direction_flips"].append(float(row[6]) if len(row) > 6 else 0.0)
             except ValueError:
                 continue
     return history
@@ -299,12 +304,17 @@ class PowerShotDashboard:
             title="Goal Rate (rolling %)", point_color="#16a34a", x_label_prefix="Episode",
         )
 
-        # Bottom-right: Avg Reward Per Episode
-        self._draw_plot(
+        # Bottom-right: Boost Used (left/orange) + Direction Flips (right/teal)
+        self._draw_dual_plot(
             x0=PLOT_PADDING + chart_w + chart_gap_x, y0=top_y + chart_h + chart_gap_y,
             width=chart_w, height=chart_h,
-            spec=plot_data.get("avg_reward", {}),
-            title="Avg Reward Per Episode", point_color="#7c3aed", x_label_prefix="Episode",
+            spec1=plot_data.get("boost_used", {}),
+            spec2=plot_data.get("direction_flips", {}),
+            title="Boost & Flips Per Episode",
+            color1="#f97316",
+            color2="#0891b2",
+            label1="boost",
+            label2="flips",
         )
 
         # Right panel: minimap + shot speed histogram + top shots leaderboard
@@ -522,6 +532,107 @@ class PowerShotDashboard:
             if len(max_pts) >= 4:
                 self.canvas.create_line(*max_pts, fill="#f59e0b", width=2, smooth=False)
 
+    def _draw_dual_plot(self, x0, y0, width, height, spec1, spec2, title, color1, color2, label1, label2):
+        """Dual-axis chart: spec1 (mean+bands) on left axis, spec2 (mean only) on right axis."""
+        x1 = x0 + width
+        y1 = y0 + height
+        self.canvas.create_rectangle(x0, y0, x1, y1, outline="#9ca3af", width=2)
+        self.canvas.create_text(x0, y0 - 16, anchor="w", text=title, fill="#111827", font=TITLE_FONT)
+
+        mean1 = spec1.get("mean", [])
+        p05_1 = spec1.get("p05", [])
+        p95_1 = spec1.get("p95", [])
+        mean2 = spec2.get("mean", [])
+        x_end_label = spec1.get("x_end_label") or spec2.get("x_end_label")
+
+        if not mean1 and not mean2:
+            self.canvas.create_text(
+                x0 + width / 2, y0 + height / 2,
+                text="Waiting for data...", fill="#6b7280", font=("Helvetica", 11),
+            )
+            return
+
+        target_points = max(60, min(MAX_RENDER_POINTS, int(width)))
+
+        if mean1:
+            plot_x1, plot_m1 = _compress_plot_series(mean1, target_points)
+            _, plot_l1 = _compress_plot_series(p05_1, target_points) if p05_1 else (plot_x1, plot_m1.copy())
+            _, plot_h1 = _compress_plot_series(p95_1, target_points) if p95_1 else (plot_x1, plot_m1.copy())
+            min1 = float(min(float(plot_l1.min()), float(plot_m1.min()), float(plot_h1.min())))
+            max1 = float(max(float(plot_l1.max()), float(plot_m1.max()), float(plot_h1.max())))
+            if max1 - min1 < 1e-6:
+                max1 = min1 + 1.0
+            n_ref1 = max(len(mean1) - 1, 1)
+        else:
+            plot_x1 = plot_m1 = plot_l1 = plot_h1 = np.empty(0)
+            min1, max1, n_ref1 = 0.0, 1.0, 1
+
+        if mean2:
+            plot_x2, plot_m2 = _compress_plot_series(mean2, target_points)
+            min2 = float(plot_m2.min())
+            max2 = float(plot_m2.max())
+            if max2 - min2 < 1e-6:
+                max2 = min2 + 1.0
+            n_ref2 = max(len(mean2) - 1, 1)
+        else:
+            plot_x2 = plot_m2 = np.empty(0)
+            min2, max2, n_ref2 = 0.0, 1.0, 1
+
+        for tick in range(5):
+            frac = tick / 4
+            y = y1 - frac * height
+            self.canvas.create_line(x0, y, x1, y, fill="#e5e7eb")
+            self.canvas.create_text(
+                x0 - 8, y, anchor="e",
+                text=f"{min1 + frac * (max1 - min1):.0f}",
+                fill=color1, font=AXIS_FONT,
+            )
+            if mean2:
+                self.canvas.create_text(
+                    x1 + 8, y, anchor="w",
+                    text=f"{min2 + frac * (max2 - min2):.1f}",
+                    fill=color2, font=AXIS_FONT,
+                )
+
+        self.canvas.create_text(x0, y1 + 14, anchor="w", text="Episode 1", fill="#6b7280", font=AXIS_FONT)
+        end_val = len(mean1 or mean2) if x_end_label is None else x_end_label
+        self.canvas.create_text(x1, y1 + 14, anchor="e", text=f"Episode {end_val}", fill="#6b7280", font=AXIS_FONT)
+
+        light1 = _lighten_color(color1)
+        base_y = y0 - 14
+        self.canvas.create_line(x1 - 215, base_y, x1 - 195, base_y, fill=color1, width=3)
+        self.canvas.create_text(x1 - 191, base_y, anchor="w", text=label1, fill=color1, font=LEGEND_FONT)
+        self.canvas.create_line(x1 - 153, base_y, x1 - 133, base_y, fill=light1, width=2, dash=(6, 6))
+        self.canvas.create_text(x1 - 129, base_y, anchor="w", text="5/95th", fill=light1, font=LEGEND_FONT)
+        self.canvas.create_line(x1 - 70, base_y, x1 - 50, base_y, fill=color2, width=3)
+        self.canvas.create_text(x1 - 46, base_y, anchor="w", text=label2, fill=color2, font=LEGEND_FONT)
+
+        if plot_m1.size >= 2:
+            if plot_l1.size >= 2:
+                pts = []
+                for xv, v in zip(plot_x1, plot_l1):
+                    pts.extend([x0 + (float(xv) / n_ref1) * width,
+                                 y1 - ((float(v) - min1) / (max1 - min1)) * height])
+                self.canvas.create_line(*pts, fill=light1, width=2, dash=(6, 6), smooth=True)
+            if plot_h1.size >= 2:
+                pts = []
+                for xv, v in zip(plot_x1, plot_h1):
+                    pts.extend([x0 + (float(xv) / n_ref1) * width,
+                                 y1 - ((float(v) - min1) / (max1 - min1)) * height])
+                self.canvas.create_line(*pts, fill=light1, width=2, dash=(6, 6), smooth=True)
+            pts = []
+            for xv, v in zip(plot_x1, plot_m1):
+                pts.extend([x0 + (float(xv) / n_ref1) * width,
+                             y1 - ((float(v) - min1) / (max1 - min1)) * height])
+            self.canvas.create_line(*pts, fill=color1, width=3, smooth=True)
+
+        if plot_m2.size >= 2:
+            pts = []
+            for xv, v in zip(plot_x2, plot_m2):
+                pts.extend([x0 + (float(xv) / n_ref2) * width,
+                             y1 - ((float(v) - min2) / (max2 - min2)) * height])
+            self.canvas.create_line(*pts, fill=color2, width=3, smooth=True)
+
 
 # ---------------------------------------------------------------------------
 # Metrics Logger (plugs into rlgym_ppo MetricsLogger interface)
@@ -563,6 +674,14 @@ class PowerShotMetricsLogger:
         self.avg_reward_p05 = _rolling_percentile(self.avg_reward, ROLLING_WINDOW, 5)
         self.avg_reward_p95 = _rolling_percentile(self.avg_reward, ROLLING_WINDOW, 95)
 
+        self.boost_used = history["boost_used"]
+        self.boost_used_rolling = _rolling_average(self.boost_used, ROLLING_WINDOW)
+        self.boost_used_p05 = _rolling_percentile(self.boost_used, ROLLING_WINDOW, 5)
+        self.boost_used_p95 = _rolling_percentile(self.boost_used, ROLLING_WINDOW, 95)
+
+        self.direction_flips = history["direction_flips"]
+        self.direction_flips_rolling = _rolling_average(self.direction_flips, ROLLING_WINDOW)
+
         # Top-5 shots by speed: list of (speed, episode)
         self.top_shots = sorted(
             [(float(s), i + 1) for i, s in enumerate(self.shot_speeds) if s > 0],
@@ -587,13 +706,16 @@ class PowerShotMetricsLogger:
         state["process_state"] = {}
         for key in (
             "episode_seconds", "shot_speeds", "goal_scored", "avg_reward",
+            "boost_used", "direction_flips",
             "ep_sec_rolling", "ep_sec_p05", "ep_sec_p95",
             "shot_speed_rolling", "shot_speed_p05", "shot_speed_p95", "shot_speed_max_series",
             "goal_rate_rolling", "goal_rate_p05", "goal_rate_p95",
             "avg_reward_rolling", "avg_reward_p05", "avg_reward_p95",
+            "boost_used_rolling", "boost_used_p05", "boost_used_p95",
+            "direction_flips_rolling",
             "top_shots",
         ):
-            state[key] = [] if key != "top_shots" else []
+            state[key] = []
         state["episode_counter"] = 0
         state["last_episode_frames"] = []
         state["cumulative_timesteps"] = 0
@@ -644,9 +766,11 @@ class PowerShotMetricsLogger:
             goal_scored,
             scoring_team,
             ball_speed,
-            0.0,  # episode_reward_sum — filled in by consumer
+            0.0,  # episode_reward_sum — unused slot
             car_speed,
             boost_amount,
+            float(car_vel[0]),
+            float(car_vel[1]),
         ], dtype=np.float32)
         return [metric]
 
@@ -702,10 +826,14 @@ class PowerShotMetricsLogger:
                 "p95": [v * 100 for v in self.goal_rate_p95],
                 "x_end_label": self.episode_counter,
             },
-            "avg_reward": {
-                "mean": self.avg_reward_rolling,
-                "p05": self.avg_reward_p05,
-                "p95": self.avg_reward_p95,
+            "boost_used": {
+                "mean": self.boost_used_rolling,
+                "p05": self.boost_used_p05,
+                "p95": self.boost_used_p95,
+                "x_end_label": self.episode_counter,
+            },
+            "direction_flips": {
+                "mean": self.direction_flips_rolling,
                 "x_end_label": self.episode_counter,
             },
             "shot_speed_hist": shot_speed_hist,
@@ -722,42 +850,55 @@ class PowerShotMetricsLogger:
         scoring_team = int(metric[8])
         ball_speed = float(metric[9])
         car_speed = float(metric[11])
+        boost_amount = float(metric[12])
+        car_vel_x = float(metric[13])
+        car_vel_y = float(metric[14])
 
-        state = self.process_state.get(pid)
-        if state is None:
-            self.process_state[pid] = {
+        # Forward-dot-velocity: positive = moving forward, negative = reversing
+        fwd_x = math.cos(heading)
+        fwd_y = math.sin(heading)
+        fwd_dot_vel = fwd_x * car_vel_x + fwd_y * car_vel_y
+
+        def _fresh_state():
+            return {
                 "last_tick": tick_count,
                 "total_steps": 1,
-                "reward_sum": 0.0,
-                "speed_sum": car_speed,
                 "goal_scored": False,
                 "scoring_team": -1,
                 "final_ball_speed": ball_speed,
+                "boost_consumed": 0.0,
+                "last_boost": boost_amount,
+                "direction_flips": 0,
+                "prev_fwd_dot_vel": fwd_dot_vel,
                 "frames": [self._make_frame(position, heading, ball_position)],
             }
+
+        state = self.process_state.get(pid)
+        if state is None:
+            self.process_state[pid] = _fresh_state()
             return
 
         if tick_count <= state["last_tick"]:
             self._finalize_episode(state)
-            self.process_state[pid] = {
-                "last_tick": tick_count,
-                "total_steps": 1,
-                "reward_sum": 0.0,
-                "speed_sum": car_speed,
-                "goal_scored": False,
-                "scoring_team": -1,
-                "final_ball_speed": ball_speed,
-                "frames": [self._make_frame(position, heading, ball_position)],
-            }
+            self.process_state[pid] = _fresh_state()
             return
 
         state["total_steps"] += 1
-        state["speed_sum"] = state.get("speed_sum", 0.0) + car_speed
         state["last_tick"] = tick_count
         state["final_ball_speed"] = ball_speed
         if goal_scored:
             state["goal_scored"] = True
             state["scoring_team"] = scoring_team
+
+        boost_step = max(0.0, state["last_boost"] - boost_amount)
+        state["boost_consumed"] = state.get("boost_consumed", 0.0) + boost_step
+        state["last_boost"] = boost_amount
+
+        prev_dot = state.get("prev_fwd_dot_vel", fwd_dot_vel)
+        if prev_dot * fwd_dot_vel < 0 and abs(fwd_dot_vel) > 50:
+            state["direction_flips"] = state.get("direction_flips", 0) + 1
+        state["prev_fwd_dot_vel"] = fwd_dot_vel
+
         state["frames"].append(self._make_frame(position, heading, ball_position))
 
     def _finalize_episode(self, state):
@@ -767,14 +908,19 @@ class PowerShotMetricsLogger:
         scoring_team = state["scoring_team"]
         shot_speed = state["final_ball_speed"] if (goal and scoring_team == 0) else 0.0
         goal_flag = 1.0 if (goal and scoring_team == 0) else 0.0
-        avg_reward = state.get("reward_sum", 0.0) / total_steps
+        avg_reward = 0.0  # reward not tracked in metric array
+        boost_used = state.get("boost_consumed", 0.0)
+        direction_flips = float(state.get("direction_flips", 0))
 
         self.episode_counter += 1
 
         _append_rolling_stats(self.episode_seconds, self.ep_sec_rolling, self.ep_sec_p05, self.ep_sec_p95, ep_seconds)
         _append_rolling_stats(self.shot_speeds, self.shot_speed_rolling, self.shot_speed_p05, self.shot_speed_p95, shot_speed)
         _append_rolling_stats(self.goal_scored, self.goal_rate_rolling, self.goal_rate_p05, self.goal_rate_p95, goal_flag)
-        _append_rolling_stats(self.avg_reward, self.avg_reward_rolling, self.avg_reward_p05, self.avg_reward_p95, avg_reward)
+        _append_rolling_stats(self.boost_used, self.boost_used_rolling, self.boost_used_p05, self.boost_used_p95, boost_used)
+        self.direction_flips.append(direction_flips)
+        window_flips = self.direction_flips[-ROLLING_WINDOW:]
+        self.direction_flips_rolling.append(float(np.mean(window_flips)))
 
         prev_max = self.shot_speed_max_series[-1] if self.shot_speed_max_series else 0.0
         self.shot_speed_max_series.append(max(prev_max, shot_speed))
@@ -793,6 +939,7 @@ class PowerShotMetricsLogger:
         with POWER_SHOT_METRICS_CSV.open("a", newline="") as handle:
             csv.writer(handle).writerow([
                 self.episode_counter, ep_seconds, shot_speed, goal_flag, avg_reward,
+                boost_used, direction_flips,
             ])
 
     @staticmethod
