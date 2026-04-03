@@ -167,6 +167,36 @@ def _rotated_triangle(cx, cy, angle, length=30, width=20):
     return out
 
 
+def _draw_dashed_polyline(draw, points, fill, width=2, dash=8, gap=5):
+    """Draw a dashed polyline through canvas (x, y) tuples."""
+    if len(points) < 2:
+        return
+    bucket = 0.0  # how far into current dash/gap segment we are
+    drawing = True
+    for i in range(len(points) - 1):
+        x0, y0 = points[i]
+        x1, y1 = points[i + 1]
+        seg = math.sqrt((x1 - x0) ** 2 + (y1 - y0) ** 2)
+        if seg < 1e-6:
+            continue
+        ux, uy = (x1 - x0) / seg, (y1 - y0) / seg
+        t = 0.0
+        while t < seg:
+            pattern = dash if drawing else gap
+            remaining = pattern - bucket
+            end_t = min(t + remaining, seg)
+            if drawing:
+                draw.line([(x0 + ux * t, y0 + uy * t), (x0 + ux * end_t, y0 + uy * end_t)],
+                          fill=fill, width=width)
+            if t + remaining >= seg:
+                bucket += seg - t
+                break
+            else:
+                t += remaining
+                bucket = 0.0
+                drawing = not drawing
+
+
 def _draw_power_shot_frame(frame, title, canvas_width=800, canvas_height=600, padding=30, trail=None):
     image = Image.new("RGB", (canvas_width, canvas_height), "#1e1b4b")
     draw = ImageDraw.Draw(image)
@@ -203,12 +233,17 @@ def _draw_power_shot_frame(frame, title, canvas_width=800, canvas_height=600, pa
     blue_rx, blue_by = to_canvas((GOAL_HALF_WIDTH, -BACK_WALL_Y))
     draw.rectangle((blue_lx, blue_ty, blue_rx, blue_by), fill="#3b82f6", outline="#1d4ed8", width=2)
 
-    # Car trail
+    # Car trail (solid blue)
     if trail and len(trail) >= 2:
         trail_pts = [to_canvas((f["car_x"], f["car_y"])) for f in trail]
         draw.line(trail_pts, fill="#93c5fd", width=2)
 
-    # Ball
+    # Ball trajectory (dashed amber)
+    if trail and len(trail) >= 2:
+        ball_pts = [to_canvas((f["ball_x"], f["ball_y"])) for f in trail]
+        _draw_dashed_polyline(draw, ball_pts, fill="#fbbf24", width=2, dash=7, gap=4)
+
+    # Ball (current position)
     ball_pos = to_canvas((frame["ball_x"], frame["ball_y"]))
     draw.ellipse((ball_pos[0] - ball_r, ball_pos[1] - ball_r,
                   ball_pos[0] + ball_r, ball_pos[1] + ball_r), fill="#f8fafc")
