@@ -149,7 +149,7 @@ def _resolve_checkpoint_parent(parent: Path):
     return str(max(numeric_dirs, key=lambda path: int(path.name)))
 
 
-def resolve_checkpoint_folder(checkpoint="latest"):
+def resolve_checkpoint_folder(checkpoint="latest", models_dir: Path = MODELS_DIR):
     if checkpoint is None:
         return None
 
@@ -167,12 +167,17 @@ def resolve_checkpoint_folder(checkpoint="latest"):
         raise FileNotFoundError(f"Checkpoint path does not exist: {checkpoint_path}")
 
     candidates = []
-    candidates.extend(_numeric_checkpoint_dirs(MODELS_DIR))
+    candidates.extend(_numeric_checkpoint_dirs(models_dir))
     candidates.extend(
         checkpoint_dir
         for run_dir in ROOT_DIR.glob("models-*")
+        if run_dir != models_dir
         for checkpoint_dir in _numeric_checkpoint_dirs(run_dir)
     )
+    # Also scan the base models/ dir in case it holds legacy/public checkpoints
+    base_models = ROOT_DIR / "models"
+    if base_models != models_dir:
+        candidates.extend(_numeric_checkpoint_dirs(base_models))
 
     if not candidates:
         return None
@@ -287,6 +292,7 @@ def _build_learner(
     log_to_wandb,
     device,
     metrics_logger,
+    models_dir: Path = MODELS_DIR,
 ):
     from rlgym_ppo import Learner
 
@@ -309,7 +315,7 @@ def _build_learner(
         standardize_returns=True,
         standardize_obs=False,
         metrics_logger=metrics_logger,
-        checkpoints_save_folder=str(MODELS_DIR),
+        checkpoints_save_folder=str(models_dir),
         add_unix_timestamp=False,
         checkpoint_load_folder=checkpoint_load_folder,
         save_every_ts=save_every_ts,
@@ -332,12 +338,13 @@ def run_learner(
     cooldown_seconds=DEFAULT_COOLDOWN_SECONDS,
     metrics_logger=None,
     checkpoint_migrate_fn=None,
+    models_dir: Path = MODELS_DIR,
 ):
     prepare_runtime_locale()
 
-    MODELS_DIR.mkdir(exist_ok=True)
+    models_dir.mkdir(exist_ok=True)
 
-    checkpoint_path = resolve_checkpoint_folder(checkpoint_load_folder)
+    checkpoint_path = resolve_checkpoint_folder(checkpoint_load_folder, models_dir=models_dir)
     if checkpoint_path is not None and checkpoint_migrate_fn is not None:
         checkpoint_migrate_fn(checkpoint_path)
     effective_save_every_ts = save_every_ts
@@ -361,6 +368,7 @@ def run_learner(
             log_to_wandb=log_to_wandb,
             device=device,
             metrics_logger=metrics_logger,
+            models_dir=models_dir,
         )
 
         restore_timer = _install_chunk_timer(train_segment_seconds) if cooldown_enabled else None

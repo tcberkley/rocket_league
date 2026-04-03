@@ -34,7 +34,7 @@ PYTORCH_ENABLE_MPS_FALLBACK=1 python main.py train --scenario dribble --dashboar
 python main.py watch --scenario dribble --renderer sandbox
 ```
 
-Checkpoints save to `models/` every 50k timesteps and training resumes from the latest checkpoint by default unless `--fresh` is passed.
+Checkpoints save to a per-scenario directory every 50k timesteps and training resumes from the latest checkpoint by default unless `--fresh` is passed. Model directories: `models/` (standard), `models-dribble/` (dribble), `models-power-shot/` (power_shot).
 
 **`--timesteps 0` = no limit** (internally maps to 5 billion, the rlgym_ppo Learner maximum). Any positive value is a hard cap. The default is 10M — if a checkpoint is already at 10M the learner exits immediately, so always pass `--timesteps` explicitly when resuming.
 
@@ -43,13 +43,15 @@ Checkpoints save to `models/` every 50k timesteps and training resumes from the 
 ## Architecture
 
 ```
-main.py           Entry point; defines standard/dribble env factories, watch mode, and CLI wiring
+main.py           Entry point; defines standard/dribble/power_shot env factories, watch mode, and CLI wiring
 rewards.py        Custom VelocityBallToGoalReward (v2 API); TouchReward is from rlgym built-ins
 learner.py        run_learner(env_create_func): configures and starts rlgym_ppo.Learner
 dribble.py        Dribble scenario mutator, reward shaping, and termination logic
 dribble_metrics.py Live dribble dashboard, CSV episode metrics logger, minimap, and record-breaker GIFs
+power_shot.py     Power Shot scenario: mutator, reward, termination, and obs (95 features)
 record_rollout.py  Record rollout GIFs with loop lane and waypoint overlays
-models/           Saved PPO checkpoints (gitignored)
+models-dribble/   Saved dribble PPO checkpoints (gitignored)
+models-power-shot/ Saved power_shot PPO checkpoints (gitignored)
 metrics/          Episode CSV logs and marker annotations
 artifacts/        Generated GIFs (rollouts and record-breakers)
 ```
@@ -154,6 +156,33 @@ A GIF is saved to `artifacts/periodic_p95/` **only when a new all-time breadcrum
 - Reached crumb positions are tracked in `_consume_metric` by detecting when `breadcrumbs_reached` count increases (car position recorded at that step), rather than reading the global.
 - `episode_reward_sum` is not overwritten when it drops to 0 (terminal reset artifact); the last non-zero value is preserved until episode finalization.
 - The terminal step frame is trimmed from episode frame lists before saving GIFs or updating the minimap.
+
+## Power Shot Scenario
+
+- `main.py --scenario power_shot` trains a single blue car to receive varied passes and shoot with maximum speed into the orange goal
+- **Observation size**: 95 features (DefaultObs 92 + 3 extra: goal_dir_x, goal_dir_y, ball_vel_toward_goal)
+- **Model directory**: `models-power-shot/` (separate from dribble)
+- **Episode length**: 12s max; 6s no-touch timeout
+- **Termination**: goal scored, or ball dead (speed < 50, z < 150) after first touch
+
+### Spawn
+`PowerShotMutator` spawns a single blue car at a random mid-field position facing the orange goal (±15° yaw noise). The ball is launched from a random angle/distance (1500–4000 uu), height (93–800 uu), and speed (500–3000 uu/s) with gravity arc compensation toward the car. Car boost set randomly 50–100%.
+
+### Reward (6 components)
+| # | Signal | Scale | Notes |
+|---|--------|-------|-------|
+| 1 | Ball velocity toward orange goal | 1.0 / 6000 | Dense, always active |
+| 2 | First touch bonus | 1.0 | One-time on first contact |
+| 3 | Subsequent touch bonus | 0.5 | Each additional touch |
+| 4 | Shot speed on goal | 5.0 * speed / 6000 | Blue scores in orange goal |
+| 5 | Own goal penalty | -3.0 | Ball goes into blue goal |
+| 6 | Approach reward | 0.2 * (1 - dist/5000) | Before first touch |
+| 7 | No-touch truncation penalty | -0.5 | Encourage interception |
+
+### To train from scratch
+```bash
+PYTORCH_ENABLE_MPS_FALLBACK=1 python main.py train --scenario power_shot --fresh --timesteps 0 --train-segment-hours 2 --cooldown-minutes 15
+```
 
 ## macOS M-Series Notes
 

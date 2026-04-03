@@ -1,11 +1,13 @@
 import argparse
 import time
+from pathlib import Path
 
 import numpy as np
 import torch
 
 from learner import (
     POLICY_LAYER_SIZES,
+    ROOT_DIR,
     DEFAULT_N_PROC,
     DEFAULT_SAVE_EVERY_TS,
     DEFAULT_COOLDOWN_SECONDS,
@@ -16,6 +18,16 @@ from learner import (
     resolve_checkpoint_folder,
     run_learner,
 )
+
+
+def get_models_dir(scenario: str) -> Path:
+    if scenario == "standard":
+        return ROOT_DIR / "models"
+    if scenario == "dribble":
+        return ROOT_DIR / "models-dribble"
+    if scenario == "power_shot":
+        return ROOT_DIR / "models-power-shot"
+    raise ValueError(f"Unknown scenario: {scenario}")
 
 
 def build_standard_rlgym_v2_env(render=False):
@@ -188,6 +200,99 @@ def build_dribble_rlgym_v2_env(render=False):
     return RLGymV2GymWrapper(rlgym_env)
 
 
+def build_power_shot_rlgym_v2_env(render=False):
+    # All imports must stay inside this function because training workers pickle it.
+    prepare_runtime_locale()
+    import numpy as np
+    from rlgym.api import RLGym
+    from rlgym.rocket_league import common_values
+    from rlgym.rocket_league.action_parsers import LookupTableAction, RepeatAction
+    from rlgym.rocket_league.done_conditions import AnyCondition, GoalCondition, NoTouchTimeoutCondition, TimeoutCondition
+    from rlgym.rocket_league.sim import RocketSimEngine
+    from rlgym.rocket_league.state_mutators import FixedTeamSizeMutator, MutatorSequence
+    from rlgym_ppo.util import RLGymV2GymWrapper
+
+    from power_shot import (
+        POWER_SHOT_EPISODE_SECONDS,
+        POWER_SHOT_NO_TOUCH_TIMEOUT,
+        POWER_SHOT_TICK_SKIP,
+        PowerShotMutator,
+        PowerShotObs,
+        PowerShotReward,
+        PowerShotTerminationCondition,
+    )
+
+    tick_skip = POWER_SHOT_TICK_SKIP
+    renderer = None
+
+    if render:
+        import os
+        import sys
+
+        rlviser_binary = os.path.join(os.getcwd(), "rlviser")
+        if not os.path.exists(rlviser_binary):
+            raise RuntimeError(
+                "Rendering requires the RLViser executable named `rlviser` in the repo root."
+            )
+
+        if sys.platform == "darwin":
+            with open(rlviser_binary, "rb") as handle:
+                magic = handle.read(4)
+            mach_o_magics = {
+                b"\xcf\xfa\xed\xfe",
+                b"\xfe\xed\xfa\xcf",
+                b"\xca\xfe\xba\xbe",
+                b"\xbe\xba\xfe\xca",
+            }
+            if magic not in mach_o_magics:
+                raise RuntimeError(
+                    "RLViser upstream does not ship a macOS viewer binary. "
+                    "Use the default `sandbox` renderer on macOS, or build RLViser locally."
+                )
+
+        try:
+            from rlgym.rocket_league.rlviser import RLViserRenderer
+        except ImportError as exc:
+            raise RuntimeError(
+                "Rendering requires RLViser. Reinstall dependencies with `pip install -r requirements.txt`."
+            ) from exc
+        renderer = RLViserRenderer(tick_rate=120 / tick_skip)
+
+    rlgym_env = RLGym(
+        state_mutator=MutatorSequence(
+            FixedTeamSizeMutator(blue_size=1, orange_size=0),
+            PowerShotMutator(),
+        ),
+        obs_builder=PowerShotObs(
+            zero_padding=1,
+            pos_coef=np.asarray(
+                [
+                    1 / common_values.SIDE_WALL_X,
+                    1 / common_values.BACK_NET_Y,
+                    1 / common_values.CEILING_Z,
+                ]
+            ),
+            ang_coef=1 / np.pi,
+            lin_vel_coef=1 / common_values.CAR_MAX_SPEED,
+            ang_vel_coef=1 / common_values.CAR_MAX_ANG_VEL,
+        ),
+        action_parser=RepeatAction(LookupTableAction(), repeats=tick_skip),
+        reward_fn=PowerShotReward(),
+        termination_cond=AnyCondition(
+            GoalCondition(),
+            PowerShotTerminationCondition(),
+        ),
+        truncation_cond=AnyCondition(
+            NoTouchTimeoutCondition(timeout_seconds=POWER_SHOT_NO_TOUCH_TIMEOUT),
+            TimeoutCondition(timeout_seconds=POWER_SHOT_EPISODE_SECONDS),
+        ),
+        transition_engine=RocketSimEngine(),
+        renderer=renderer,
+    )
+
+    return RLGymV2GymWrapper(rlgym_env)
+
+
 def build_training_env():
     return build_standard_rlgym_v2_env(render=False)
 
@@ -196,11 +301,17 @@ def build_dribble_training_env():
     return build_dribble_rlgym_v2_env(render=False)
 
 
+def build_power_shot_training_env():
+    return build_power_shot_rlgym_v2_env(render=False)
+
+
 def get_env_builder(scenario):
     if scenario == "standard":
         return build_standard_rlgym_v2_env
     if scenario == "dribble":
         return build_dribble_rlgym_v2_env
+    if scenario == "power_shot":
+        return build_power_shot_rlgym_v2_env
     raise ValueError(f"Unsupported scenario: {scenario}")
 
 
@@ -209,6 +320,8 @@ def get_training_env_builder(scenario):
         return build_training_env
     if scenario == "dribble":
         return build_dribble_training_env
+    if scenario == "power_shot":
+        return build_power_shot_training_env
     raise ValueError(f"Unsupported scenario: {scenario}")
 
 
@@ -231,7 +344,7 @@ def watch_checkpoint(
     prepare_runtime_locale()
     from rlgym_ppo.ppo.discrete_policy import DiscreteFF
 
-    checkpoint_path = resolve_checkpoint_folder(checkpoint)
+    checkpoint_path = resolve_checkpoint_folder(checkpoint, models_dir=get_models_dir(scenario))
     if checkpoint_path is None:
         raise FileNotFoundError("No checkpoint found. Train first or pass --checkpoint to an existing save.")
 
@@ -303,7 +416,7 @@ def parse_args():
     train_parser.add_argument("--n-proc", type=int, default=DEFAULT_N_PROC)
     train_parser.add_argument("--checkpoint", default="latest")
     train_parser.add_argument("--fresh", action="store_true", help="Start a new run instead of loading the latest checkpoint.")
-    train_parser.add_argument("--scenario", choices=("standard", "dribble"), default="standard")
+    train_parser.add_argument("--scenario", choices=("standard", "dribble", "power_shot"), default="standard")
     train_parser.add_argument("--dashboard", action="store_true", help="Show a live local dashboard during dribble training.")
     train_parser.add_argument(
         "--dashboard-update-seconds",
@@ -329,7 +442,7 @@ def parse_args():
     watch_parser = subparsers.add_parser("watch", help="Watch a saved checkpoint play in self-play.")
     watch_parser.add_argument("--checkpoint", default="latest")
     watch_parser.add_argument("--episodes", type=int, default=3)
-    watch_parser.add_argument("--scenario", choices=("standard", "dribble"), default="standard")
+    watch_parser.add_argument("--scenario", choices=("standard", "dribble", "power_shot"), default="standard")
     watch_parser.add_argument("--renderer", choices=("sandbox", "rlviser", "headless"), default="sandbox")
     watch_parser.add_argument("--render-delay", type=float, default=1 / 15)
     watch_parser.add_argument("--max-steps", type=int)
@@ -361,6 +474,7 @@ def main():
             cooldown_seconds=args.cooldown_minutes * 60,
             metrics_logger=metrics_logger,
             checkpoint_migrate_fn=migrate_dribble_carry_quality_obs if args.scenario == "dribble" else None,
+            models_dir=get_models_dir(args.scenario),
         )
         return
 
