@@ -38,7 +38,7 @@ GRAVITY = 650.0               # uu/s^2
 # ---------------------------------------------------------------------------
 _CURRICULUM = [
     # threshold, angle_half_arc, height_min, height_max, speed_min, speed_max, dist_min, dist_max
-    (25_000,  math.radians(40),  93,  93,   200,  700,  600,  1800),
+    (125_000, math.radians(40),  93,  93,   200,  700,  600,  1800),
     (75_000,  math.radians(90),  93, 300,   300, 1500,  800,  2800),
     (None,    math.pi,           93, 800,   500, 3000, 1500,  4000),
 ]
