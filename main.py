@@ -460,6 +460,10 @@ def main():
             from dribble_metrics import DribbleMetricsLogger
 
             metrics_logger = DribbleMetricsLogger(dashboard_update_seconds=args.dashboard_update_seconds)
+        if args.scenario == "power_shot" and args.dashboard:
+            from power_shot_metrics import PowerShotMetricsLogger
+
+            metrics_logger = PowerShotMetricsLogger(dashboard_update_seconds=args.dashboard_update_seconds)
         # 0 means no limit — use the rlgym_ppo Learner's own practical maximum.
         timestep_limit = 5_000_000_000 if args.timesteps == 0 else args.timesteps
         run_learner(
