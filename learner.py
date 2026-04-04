@@ -390,4 +390,4 @@ def run_learner(
             f"after {train_segment_seconds / 3600:.1f} hours of training..."
         )
         time.sleep(cooldown_seconds)
-        checkpoint_path = resolve_checkpoint_folder("latest")
+        checkpoint_path = resolve_checkpoint_folder("latest", models_dir=models_dir)

@@ -27,6 +27,8 @@ def get_models_dir(scenario: str) -> Path:
         return ROOT_DIR / "models-dribble"
     if scenario == "power_shot":
         return ROOT_DIR / "models-power-shot"
+    if scenario == "catch_ball":
+        return ROOT_DIR / "models-catch-ball"
     raise ValueError(f"Unknown scenario: {scenario}")
 
 
@@ -310,7 +312,7 @@ def get_env_builder(scenario):
         return build_standard_rlgym_v2_env
     if scenario == "dribble":
         return build_dribble_rlgym_v2_env
-    if scenario == "power_shot":
+    if scenario in ("power_shot", "catch_ball"):
         return build_power_shot_rlgym_v2_env
     raise ValueError(f"Unsupported scenario: {scenario}")
 
@@ -320,7 +322,7 @@ def get_training_env_builder(scenario):
         return build_training_env
     if scenario == "dribble":
         return build_dribble_training_env
-    if scenario == "power_shot":
+    if scenario in ("power_shot", "catch_ball"):
         return build_power_shot_training_env
     raise ValueError(f"Unsupported scenario: {scenario}")
 
@@ -416,7 +418,7 @@ def parse_args():
     train_parser.add_argument("--n-proc", type=int, default=DEFAULT_N_PROC)
     train_parser.add_argument("--checkpoint", default="latest")
     train_parser.add_argument("--fresh", action="store_true", help="Start a new run instead of loading the latest checkpoint.")
-    train_parser.add_argument("--scenario", choices=("standard", "dribble", "power_shot"), default="standard")
+    train_parser.add_argument("--scenario", choices=("standard", "dribble", "power_shot", "catch_ball"), default="standard")
     train_parser.add_argument("--dashboard", action="store_true", help="Show a live local dashboard during dribble training.")
     train_parser.add_argument(
         "--dashboard-update-seconds",
@@ -442,7 +444,7 @@ def parse_args():
     watch_parser = subparsers.add_parser("watch", help="Watch a saved checkpoint play in self-play.")
     watch_parser.add_argument("--checkpoint", default="latest")
     watch_parser.add_argument("--episodes", type=int, default=3)
-    watch_parser.add_argument("--scenario", choices=("standard", "dribble", "power_shot"), default="standard")
+    watch_parser.add_argument("--scenario", choices=("standard", "dribble", "power_shot", "catch_ball"), default="standard")
     watch_parser.add_argument("--renderer", choices=("sandbox", "rlviser", "headless"), default="sandbox")
     watch_parser.add_argument("--render-delay", type=float, default=1 / 15)
     watch_parser.add_argument("--max-steps", type=int)
