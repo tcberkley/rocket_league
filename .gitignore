@@ -14,3 +14,4 @@ rlviser
 artifacts/*.gif
 artifacts/periodic_p95/
 metrics/
+rl-viewer/target/
