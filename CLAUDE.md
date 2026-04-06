@@ -159,29 +159,38 @@ A GIF is saved to `artifacts/periodic_p95/` **only when a new all-time breadcrum
 
 ## Power Shot Scenario
 
-- `main.py --scenario power_shot` trains a single blue car to receive varied passes and shoot with maximum speed into the orange goal
+- `main.py --scenario power_shot` trains a single blue car to shoot with maximum speed into the orange goal
 - **Observation size**: 95 features (DefaultObs 92 + 3 extra: goal_dir_x, goal_dir_y, ball_vel_toward_goal)
 - **Model directory**: `models-power-shot/` (separate from dribble)
-- **Episode length**: 12s max; 6s no-touch timeout
-- **Termination**: goal scored, or ball dead (speed < 50, z < 150) after first touch
+- **Episode length**: 8s max; 6s no-touch timeout; 3s post-touch timer (anti-dribble)
+- **Termination**: goal scored, ball dead (speed < 50, z < 150) after touch, or 3s elapsed after first touch
 
-### Spawn
-`PowerShotMutator` spawns a single blue car at a random mid-field position facing the orange goal (±15° yaw noise). The ball is launched from a random angle/distance (1500–4000 uu), height (93–800 uu), and speed (500–3000 uu/s) with gravity arc compensation toward the car. Car boost set randomly 50–100%.
+### 3-Stage Curriculum (goal-rate gated)
 
-### Reward (6 components)
-| # | Signal | Scale | Notes |
-|---|--------|-------|-------|
-| 1 | Ball velocity toward orange goal | 1.0 / 6000 | Dense, always active |
-| 2 | First touch bonus | 1.0 | One-time on first contact |
-| 3 | Subsequent touch bonus | 0.5 | Each additional touch |
-| 4 | Shot speed on goal | 5.0 * speed / 6000 | Blue scores in orange goal |
-| 5 | Own goal penalty | -3.0 | Ball goes into blue goal |
-| 6 | Approach reward | 0.2 * (1 - dist/5000) | Before first touch |
-| 7 | No-touch truncation penalty | -0.5 | Encourage interception |
+Stages advance automatically when the **per-worker rolling 100-episode goal rate hits 50%**. No fixed episode thresholds.
+
+| Stage | Ball behavior | Car Y range | Advances when |
+|-------|---------------|-------------|---------------|
+| 0 | Ball dropped in place 250–450 uu ahead, bounces freely | [1000, 3000] | 50% goal rate |
+| 1 | Ball crosses car's path laterally (200–600 uu/s) | [500, 2500] | 50% goal rate |
+| 2 | Full variety — wide angles (±90°), heights (93–800 uu), speeds (500–2500 uu/s) | [-2000, 2000] | — |
+
+### Reward (per stage)
+| Signal | Stage 0 | Stage 1 | Stage 2 | Notes |
+|--------|---------|---------|---------|-------|
+| Approach (inv-distance) | 0.1 | 0.1 | 0.1 | Pre-touch only; `max(0, 1 - dist/3000)` |
+| First touch | 5.0 | 3.0 | 1.5 | One-time on contact |
+| Post-touch ball speed | 3.0 | 3.0 | 2.0 | `× ball_speed/6000` at moment of touch |
+| Goal (base) | 10.0 | 8.0 | 5.0 | Terminal, blue scores |
+| Shot speed on goal | 5.0 | 8.0 | 10.0 | `× ball_speed/6000` |
+| No-touch penalty | -3.0 | -3.0 | -3.0 | Episode ends without touch |
+| Own goal penalty | -1.0 | -2.0 | -3.0 | Ball goes into blue goal |
+
+Approach reward uses **inverse-distance** (not closing speed) to prevent oscillation reward-hacking.
 
 ### To train from scratch
 ```bash
-PYTORCH_ENABLE_MPS_FALLBACK=1 python main.py train --scenario power_shot --fresh --timesteps 0 --train-segment-hours 2 --cooldown-minutes 15
+PYTORCH_ENABLE_MPS_FALLBACK=1 python main.py train --scenario power_shot --fresh --timesteps 0 --train-segment-hours 2 --cooldown-minutes 15 --dashboard
 ```
 
 ## macOS M-Series Notes

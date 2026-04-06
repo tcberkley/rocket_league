@@ -149,7 +149,7 @@ def _resolve_checkpoint_parent(parent: Path):
     return str(max(numeric_dirs, key=lambda path: int(path.name)))
 
 
-def resolve_checkpoint_folder(checkpoint="latest", models_dir: Path = MODELS_DIR):
+def resolve_checkpoint_folder(checkpoint="latest", models_dir: Path = MODELS_DIR, strict: bool = False):
     if checkpoint is None:
         return None
 
@@ -168,16 +168,17 @@ def resolve_checkpoint_folder(checkpoint="latest", models_dir: Path = MODELS_DIR
 
     candidates = []
     candidates.extend(_numeric_checkpoint_dirs(models_dir))
-    candidates.extend(
-        checkpoint_dir
-        for run_dir in ROOT_DIR.glob("models-*")
-        if run_dir != models_dir
-        for checkpoint_dir in _numeric_checkpoint_dirs(run_dir)
-    )
-    # Also scan the base models/ dir in case it holds legacy/public checkpoints
-    base_models = ROOT_DIR / "models"
-    if base_models != models_dir:
-        candidates.extend(_numeric_checkpoint_dirs(base_models))
+    if not strict:
+        candidates.extend(
+            checkpoint_dir
+            for run_dir in ROOT_DIR.glob("models-*")
+            if run_dir != models_dir
+            for checkpoint_dir in _numeric_checkpoint_dirs(run_dir)
+        )
+        # Also scan the base models/ dir in case it holds legacy/public checkpoints
+        base_models = ROOT_DIR / "models"
+        if base_models != models_dir:
+            candidates.extend(_numeric_checkpoint_dirs(base_models))
 
     if not candidates:
         return None

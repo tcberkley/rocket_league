@@ -340,13 +340,25 @@ def watch_checkpoint(
     episodes=3,
     scenario="standard",
     renderer="sandbox",
-    render_delay=1 / 15,
+    render_delay=None,
     max_steps=None,
+    record=None,
 ):
+    if render_delay is None:
+        if renderer == "rust":
+            from dribble import DRIBBLE_TICK_SKIP
+            from power_shot import POWER_SHOT_TICK_SKIP
+            tick_skip = DRIBBLE_TICK_SKIP if scenario == "dribble" else POWER_SHOT_TICK_SKIP
+            render_delay = tick_skip / 120.0
+        elif renderer == "rlviser":
+            render_delay = 1 / 15
+        else:
+            render_delay = 0.0
+
     prepare_runtime_locale()
     from rlgym_ppo.ppo.discrete_policy import DiscreteFF
 
-    checkpoint_path = resolve_checkpoint_folder(checkpoint, models_dir=get_models_dir(scenario))
+    checkpoint_path = resolve_checkpoint_folder(checkpoint, models_dir=get_models_dir(scenario), strict=True)
     if checkpoint_path is None:
         raise FileNotFoundError("No checkpoint found. Train first or pass --checkpoint to an existing save.")
 
@@ -355,8 +367,21 @@ def watch_checkpoint(
     obs_size = int(np.prod(env.observation_space.shape))
     action_count = env.action_space.n
 
+    state_dict = torch.load(f"{checkpoint_path}/PPO_POLICY.pt", map_location="cpu")
+    ckpt_obs_size = state_dict["model.0.weight"].shape[1]
+    if ckpt_obs_size != obs_size:
+        # Pad (or trim) the first-layer weights so the checkpoint matches the
+        # current obs size — new columns are zero so the model simply ignores
+        # the extra features.
+        w = state_dict["model.0.weight"]
+        if ckpt_obs_size < obs_size:
+            pad = torch.zeros(w.shape[0], obs_size - ckpt_obs_size, dtype=w.dtype)
+            state_dict["model.0.weight"] = torch.cat([w, pad], dim=1)
+        else:
+            state_dict["model.0.weight"] = w[:, :obs_size]
+        print(f"[watch] Padded policy obs dim {ckpt_obs_size} → {obs_size}")
     policy = DiscreteFF(obs_size, action_count, POLICY_LAYER_SIZES, "cpu")
-    policy.load_state_dict(torch.load(f"{checkpoint_path}/PPO_POLICY.pt", map_location="cpu"))
+    policy.load_state_dict(state_dict)
     policy.eval()
     viewer = None
 
@@ -365,11 +390,19 @@ def watch_checkpoint(
 
         viewer = SandboxViewer(scenario=scenario)
 
+    elif renderer == "rust":
+        from rust_viewer import RustViewer
+
+        viewer = RustViewer(record=record)
+
     try:
         for episode in range(1, episodes + 1):
             observations = env.reset()
             episode_rewards = np.zeros(len(observations), dtype=np.float32)
             step_count = 0
+
+            if viewer is not None and hasattr(viewer, "reset"):
+                viewer.reset()
 
             if viewer is not None and not viewer.update(env.rlgym_env.state, episode, step_count):
                 return
@@ -390,8 +423,8 @@ def watch_checkpoint(
 
                 if use_rlviser:
                     env.render()
-                    if render_delay > 0:
-                        time.sleep(render_delay)
+                if render_delay > 0 and (use_rlviser or renderer == "rust"):
+                    time.sleep(render_delay)
 
                 reached_step_cap = max_steps is not None and step_count >= max_steps
                 if terminated or truncated or reached_step_cap:
@@ -445,9 +478,12 @@ def parse_args():
     watch_parser.add_argument("--checkpoint", default="latest")
     watch_parser.add_argument("--episodes", type=int, default=3)
     watch_parser.add_argument("--scenario", choices=("standard", "dribble", "power_shot", "catch_ball"), default="standard")
-    watch_parser.add_argument("--renderer", choices=("sandbox", "rlviser", "headless"), default="sandbox")
-    watch_parser.add_argument("--render-delay", type=float, default=1 / 15)
+    watch_parser.add_argument("--renderer", choices=("sandbox", "rlviser", "headless", "rust"), default="sandbox")
+    watch_parser.add_argument("--render-delay", type=float, default=None,
+                              help="Seconds to sleep between steps. Defaults to real-time (tick_skip/120Hz) for rust renderer, 1/15 for rlviser.")
     watch_parser.add_argument("--max-steps", type=int)
+    watch_parser.add_argument("--record", metavar="OUTPUT.mp4",
+                              help="Save a video of the episode (requires ffmpeg). Only used with --renderer rust.")
 
     return parser.parse_args()
 
@@ -492,6 +528,7 @@ def main():
             renderer=args.renderer,
             render_delay=args.render_delay,
             max_steps=args.max_steps,
+            record=args.record,
         )
         return
 

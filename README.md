@@ -53,9 +53,31 @@ Useful options:
 
 By default, training resumes from the latest checkpoint in `models/` unless `--fresh` is passed.
 
+## Demo
+
+A recorded episode of the dribble bot carrying the ball for the full 3-minute episode limit is in [`artifacts/dribble_replay.mp4`](artifacts/dribble_replay.mp4).
+
 ## Watching The Bot
 
-Watch the latest checkpoint in the built-in sandbox viewer:
+The repo includes a native 3D renderer written in Rust (`rl-viewer/`) using wgpu + Metal on macOS. Build it once with:
+
+```bash
+cd rl-viewer && cargo build --release
+```
+
+Then watch the latest dribble checkpoint in 3D:
+
+```bash
+python main.py watch --scenario dribble --renderer rust
+```
+
+Record an episode to a video file (requires ffmpeg):
+
+```bash
+python main.py watch --scenario dribble --renderer rust --episodes 1 --record replay.mp4
+```
+
+You can also use the 2D sandbox viewer:
 
 ```bash
 python main.py watch --scenario dribble --renderer sandbox

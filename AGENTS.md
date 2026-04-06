@@ -24,21 +24,33 @@ PYTORCH_ENABLE_MPS_FALLBACK=1 python main.py train
 Useful variants:
 
 ```bash
-PYTORCH_ENABLE_MPS_FALLBACK=1 python main.py train --scenario dribble --dashboard
+# Dribble (ball-carry) training
+PYTORCH_ENABLE_MPS_FALLBACK=1 python main.py train --scenario dribble --dashboard --timesteps 0 --train-segment-hours 2 --cooldown-minutes 15
+
+# Power shot training (fresh start)
+PYTORCH_ENABLE_MPS_FALLBACK=1 python main.py train --scenario power_shot --fresh --timesteps 0 --train-segment-hours 2 --cooldown-minutes 15 --dashboard
+
+# Watch a checkpoint
 python main.py watch --scenario dribble --renderer sandbox
+python main.py watch --scenario power_shot --renderer sandbox
 ```
 
-Checkpoints save to `models/` every 50k timesteps and training resumes from the latest checkpoint by default unless `--fresh` is passed. The CLI also supports timed cooldowns between training segments via `--train-segment-hours` and `--cooldown-minutes`.
+Checkpoints save to a per-scenario directory every 50k timesteps and resume from the latest by default unless `--fresh` is passed. `--timesteps 0` means no limit. The CLI supports timed cooldowns via `--train-segment-hours` and `--cooldown-minutes`.
 
 ## Architecture
 
 ```
-main.py           Entry point; defines standard/dribble env factories, watch mode, and CLI wiring
-rewards.py        Custom VelocityBallToGoalReward (v2 API); TouchReward is from rlgym built-ins
-learner.py        run_learner(env_create_func): configures and starts rlgym_ppo.Learner
-dribble.py        Dribble scenario mutator, reward shaping, and termination logic
-dribble_metrics.py Live dribble dashboard + CSV episode metrics logger
-models/           Saved PPO checkpoints (gitignored)
+main.py            Entry point; defines standard/dribble/power_shot env factories, watch mode, and CLI wiring
+rewards.py         Custom VelocityBallToGoalReward (v2 API); TouchReward is from rlgym built-ins
+learner.py         run_learner(env_create_func): configures and starts rlgym_ppo.Learner
+dribble.py         Dribble scenario mutator, reward shaping, and termination logic
+dribble_metrics.py Live dribble dashboard, CSV episode metrics logger, minimap, and record-breaker GIFs
+power_shot.py      Power Shot scenario: 3-stage curriculum, mutator, reward, termination, obs (95 features)
+record_rollout.py  Record rollout GIFs with loop lane and waypoint overlays
+models-dribble/    Saved dribble PPO checkpoints (gitignored)
+models-power-shot/ Saved power_shot PPO checkpoints (gitignored)
+metrics/           Episode CSV logs and marker annotations
+artifacts/         Generated GIFs (rollouts and record-breakers)
 ```
 
 ### Data flow
@@ -63,10 +75,21 @@ models/           Saved PPO checkpoints (gitignored)
 
 ## Dribble Scenario
 
-- `main.py --scenario dribble` trains a single-car carry task instead of standard 1v1
-- `DribbleStartMutator` in `dribble.py` now uses randomized stable starts: random field position, random yaw, small hood-placement noise for the ball, and randomized initial speed
-- Goal mouths are treated as failure zones in dribble mode, so driving into the goal ends the episode
-- The dribble reward combines carry quality, forward movement while carrying, and a small anti-stall mechanism
+- `main.py --scenario dribble` trains a single-car ball-carry task (no opponent)
+- `DribbleStartMutator` spawns the car on a tangent line outside the ellipse loop with the ball on the hood
+- **Termination**: ball touches the ground, or car/ball enters a goal mouth
+- **Reward**: carry quality, breadcrumb waypoint approach/success bonuses, speed comfort zone, wall penalties, terminal drop penalty
+- Curriculum ramps easy → hard based on episode count (spawn speed, ellipse size, loop lane margins)
+
+## Power Shot Scenario
+
+- `main.py --scenario power_shot` trains a single blue car to shoot with maximum speed into the orange goal
+- **Observation**: 95 features (DefaultObs 92 + goal_dir_x, goal_dir_y, ball_vel_toward_goal)
+- **Curriculum**: 3 stages, gated by rolling 50% goal rate — not episode count
+  - Stage 0: ball drops in place ahead of car (bouncing), car in attacking half
+  - Stage 1: ball crosses car's path laterally
+  - Stage 2: full variety (wide angles, heights, speeds)
+- **Reward**: inverse-distance approach (pre-touch), large first-touch and goal bonuses; approach uses `1 - dist/3000` not closing-speed to prevent oscillation hacking
 
 ## Dashboard Metrics
 

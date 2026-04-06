@@ -1,22 +1,28 @@
 """
-Power Shot scenario: bot receives varied passes and is judged on shot speed into the opponent's goal.
+Power Shot scenario: train a bot to shoot balls in front of it into the orange goal.
 
-6-stage curriculum (per-worker thresholds; multiply by ~4 for global episode count):
-  Stage 0 (0–25k/w,  ~0–100k global):   slow ground ball 300–600 uu ahead, ±15°. Drive up and shoot.
-  Stage 1 (25–50k/w, ~100–200k global): short rolling passes, ±25°.
-  Stage 2 (50–75k/w, ~200–300k global): medium passes, ±45°, slight height.
-  Stage 3 (75–100k/w,~300–400k global): longer arcing passes, ±70°.
-  Stage 4 (100–125k/w,~400–500k global):hard passes, ±90°, significant height.
-  Stage 5 (125k+/w,  ~500k+ global):    full chaos — 360°, 0–800 uu, 500–3000 uu/s.
+4-stage curriculum gated by per-stage rolling goal rate:
+  Stage 0: Stationary ground ball 300–500 uu ahead, ±5°, car close to goal.
+           Advance at 30% goal rate.
+  Stage 1: Ground ball 400–800 uu ahead, ±15°, moderate distance.
+           Advance at 40% goal rate.
+  Stage 2: Ground or low-bounce ball 500–1200 uu ahead, ±25°.
+           Advance at 50% goal rate.
+  Stage 3: Ground or bounce ball 600–2000 uu ahead, ±40°, full field. No cap.
 
-Reward design: NO dense ball-velocity or repeated-touch rewards — those teach dribbling.
-Instead: approach (pre-touch), one-time first-touch bonus, one-time post-touch ball speed
-bonus (fires at the moment of contact), and a large goal + shot-speed terminal reward.
-Episode ends 3 seconds after first touch so there is no time to dribble.
+Reward design:
+  - Small inverse-distance approach reward pre-touch (can't be hacked)
+  - One-time first-touch bonus
+  - One-time directional hit bonus at moment of touch: dot(ball_vel, goal_dir) — rewards hard, on-target hits
+  - Large terminal goal + shot-speed bonus
+  - Second-touch penalty if the car contacts the ball again after the first hit
+  - No-touch and own-goal penalties
+  Episode ends 1.5 seconds after first touch — barely enough time for ball to reach goal, no time to dribble.
 """
 
 import math
 import random
+from collections import deque
 from typing import Any, Dict
 
 import numpy as np
@@ -24,14 +30,12 @@ import numpy as np
 # ---------------------------------------------------------------------------
 # Constants
 # ---------------------------------------------------------------------------
-POWER_SHOT_EPISODE_SECONDS = 8        # 12→8: bot shouldn't need 12s to intercept
+POWER_SHOT_EPISODE_SECONDS = 8
 POWER_SHOT_TICK_SKIP = 8
 POWER_SHOT_NO_TOUCH_TIMEOUT = 6
-POWER_SHOT_POST_TOUCH_SECONDS = 3.0  # episode ends this many seconds after first touch
+POWER_SHOT_POST_TOUCH_SECONDS = 1.5
 
 CAR_SPAWN_X_RANGE = 2500
-CAR_SPAWN_Y_MIN = -2000
-CAR_SPAWN_Y_MAX = 2000
 
 BACK_WALL_Y = 5120
 GOAL_CENTER_TO_POST = 892.755
@@ -40,103 +44,152 @@ BALL_MAX_SPEED = 6000
 ORANGE_GOAL_Y = BACK_WALL_Y
 GRAVITY = 650.0
 
-# Physics: decisions per second = 120 / tick_skip
 _DPS = 120.0 / POWER_SHOT_TICK_SKIP
 _POST_TOUCH_STEPS = int(POWER_SHOT_POST_TOUCH_SECONDS * _DPS)  # 45 steps = 3s
 
 # ---------------------------------------------------------------------------
-# Unified curriculum
-# Each row: (per_worker_threshold, spawn_cfg, reward_cfg)
+# Stage progression
+# ---------------------------------------------------------------------------
+STAGE_ADVANCE_WINDOW = 100  # rolling window in episodes
+
+# Per-worker module-level state (each worker process has its own copy)
+_worker_goal_history: deque = deque(maxlen=STAGE_ADVANCE_WINDOW)
+_worker_current_stage: int = 0
+
+
+def _record_episode_outcome(scored: bool) -> None:
+    """Called at end of each episode. Advances stage when rolling goal rate clears threshold."""
+    global _worker_current_stage
+    _worker_goal_history.append(1 if scored else 0)
+    if (
+        len(_worker_goal_history) >= STAGE_ADVANCE_WINDOW
+        and _worker_current_stage < len(_CURRICULUM) - 1
+    ):
+        goal_rate = sum(_worker_goal_history) / len(_worker_goal_history)
+        advance_rate = _CURRICULUM[_worker_current_stage]["advance_rate"]
+        if goal_rate >= advance_rate:
+            _worker_current_stage += 1
+            _worker_goal_history.clear()
+
+
+def _get_stage():
+    return _CURRICULUM[_worker_current_stage]
+
+
+# ---------------------------------------------------------------------------
+# Curriculum
 #
-# spawn_cfg keys:
-#   angle  — half-arc from car forward direction (radians)
-#   h_min/h_max — ball height range (uu)
-#   s_min/s_max — ball launch speed range (uu/s)
-#   d_min/d_max — ball distance from car (uu)
+# spawn keys:
+#   angle         — half-arc from car→goal direction (radians)
+#   d_min/d_max   — ball distance ahead of car (uu)
+#   h_min/h_max   — ball start height (uu); 93 = ground; >93 = dropped from height
+#   ground_frac   — fraction of episodes where ball starts on the ground (z=93)
+#   car_y_min/max — car spawn Y range
+#   car_yaw_noise — max yaw deviation from facing goal (radians)
 #
-# reward_cfg keys:
-#   approach_w         — weight on closing-distance reward before first touch
-#   first_touch        — one-time bonus on first contact
-#   post_touch_speed_w — one-time bonus * ball_speed/6000 at moment of first touch
-#   goal_base          — flat bonus on scoring in orange goal
-#   shot_speed_w       — multiplier on speed/6000 bonus on goal
-#   no_touch_pen       — penalty when episode times out with no touch
-#   own_goal_pen       — penalty when bot scores in own goal
+# reward keys:
+#   approach_w        — inverse-distance pre-touch weight (small; anti-hack)
+#   first_touch       — one-time bonus on first contact
+#   hit_direction_w   — one-time bonus at touch: w × max(0, dot(ball_vel, goal_dir)/6000)
+#                       rewards hitting hard AND toward goal in one shot
+#   goal_base         — flat terminal bonus on scoring in orange goal
+#   shot_speed_w      — terminal × ball_speed/6000 bonus on goal
+#   second_touch_pen  — penalty if car contacts ball again after first hit
+#   no_touch_pen      — penalty when episode ends without any touch
+#   own_goal_pen      — penalty when bot scores in own goal
 #
-# Removed from old design: ball_vel_w (dribble incentive), subseq_touch (dribble incentive)
+# advance_rate: rolling goal rate needed to advance to the next stage
 # ---------------------------------------------------------------------------
 _CURRICULUM = [
-    # Stage 0: ~0–100k global — slow ground ball 300–600 uu directly ahead. Drive up and one-touch it.
-    # d_min=300 keeps ball outside 200 uu touch-detection radius at spawn.
-    # s_min=100 ensures ball speed > 50 uu/s (dead-ball threshold) until car actually hits it.
-    (25_000,
-     dict(angle=math.radians(15), h_min=93, h_max=93,  s_min=100, s_max=250,  d_min=300,  d_max=600),
-     dict(approach_w=2.0, first_touch=2.0, post_touch_speed_w=4.0,
-          goal_base=3.0,  shot_speed_w=8.0, no_touch_pen=-0.5, own_goal_pen=-1.0)),
+    # Stage 0: Point-blank stationary ground ball.
+    # Car close to goal, ball straight ahead — a random forward drive can score.
+    {
+        "spawn": dict(
+            angle=math.radians(5),
+            d_min=300, d_max=500,
+            h_min=93, h_max=93,   # ground only
+            ground_frac=1.0,
+            car_y_min=2500, car_y_max=3500,
+            car_yaw_noise=math.radians(5),
+        ),
+        "reward": dict(
+            approach_w=0.05, first_touch=2.0, hit_direction_w=8.0,
+            goal_base=10.0, shot_speed_w=3.0,
+            second_touch_pen=-2.0, no_touch_pen=-2.0, own_goal_pen=-1.0,
+        ),
+        "advance_rate": 0.30,
+    },
 
-    # Stage 1: ~100–200k global — short rolls, ±25°.
-    (50_000,
-     dict(angle=math.radians(25), h_min=93, h_max=93,  s_min=100, s_max=400,  d_min=400,  d_max=1000),
-     dict(approach_w=2.0, first_touch=1.5, post_touch_speed_w=3.0,
-          goal_base=2.0,  shot_speed_w=8.0, no_touch_pen=-0.5, own_goal_pen=-2.0)),
+    # Stage 1: Medium-range ground ball, wider angle variety.
+    {
+        "spawn": dict(
+            angle=math.radians(15),
+            d_min=400, d_max=800,
+            h_min=93, h_max=93,
+            ground_frac=1.0,
+            car_y_min=1500, car_y_max=3000,
+            car_yaw_noise=math.radians(10),
+        ),
+        "reward": dict(
+            approach_w=0.05, first_touch=1.5, hit_direction_w=8.0,
+            goal_base=10.0, shot_speed_w=5.0,
+            second_touch_pen=-2.0, no_touch_pen=-2.0, own_goal_pen=-2.0,
+        ),
+        "advance_rate": 0.40,
+    },
 
-    # Stage 2: ~200–300k global — medium passes, ±45°, slight height.
-    (75_000,
-     dict(angle=math.radians(45), h_min=93, h_max=150, s_min=150, s_max=700,  d_min=500,  d_max=1500),
-     dict(approach_w=1.5, first_touch=1.5, post_touch_speed_w=2.0,
-          goal_base=2.0,  shot_speed_w=8.0, no_touch_pen=-0.5, own_goal_pen=-2.0)),
+    # Stage 2: Ground or low-bounce ball, wider spawns.
+    {
+        "spawn": dict(
+            angle=math.radians(25),
+            d_min=500, d_max=1200,
+            h_min=93, h_max=200,
+            ground_frac=0.5,
+            car_y_min=500, car_y_max=2500,
+            car_yaw_noise=math.radians(15),
+        ),
+        "reward": dict(
+            approach_w=0.05, first_touch=1.0, hit_direction_w=6.0,
+            goal_base=8.0, shot_speed_w=8.0,
+            second_touch_pen=-3.0, no_touch_pen=-2.0, own_goal_pen=-3.0,
+        ),
+        "advance_rate": 0.50,
+    },
 
-    # Stage 3: ~300–400k global — longer arcing passes, ±70°.
-    (100_000,
-     dict(angle=math.radians(70), h_min=93, h_max=300, s_min=250, s_max=1200, d_min=800,  d_max=2500),
-     dict(approach_w=1.5, first_touch=1.0, post_touch_speed_w=1.5,
-          goal_base=1.0,  shot_speed_w=10.0, no_touch_pen=-0.5, own_goal_pen=-3.0)),
-
-    # Stage 4: ~400–500k global — hard passes, ±90°, significant height.
-    (125_000,
-     dict(angle=math.radians(90), h_min=93, h_max=500, s_min=400, s_max=2000, d_min=1200, d_max=3500),
-     dict(approach_w=1.0, first_touch=1.0, post_touch_speed_w=1.0,
-          goal_base=1.0,  shot_speed_w=10.0, no_touch_pen=-0.5, own_goal_pen=-3.0)),
-
-    # Stage 5: ~500k+ global — full chaos.
-    (None,
-     dict(angle=math.pi,           h_min=93, h_max=800, s_min=500, s_max=3000, d_min=1500, d_max=4000),
-     dict(approach_w=1.0, first_touch=1.0, post_touch_speed_w=1.0,
-          goal_base=1.0,  shot_speed_w=10.0, no_touch_pen=-0.5, own_goal_pen=-3.0)),
+    # Stage 3: Full field, wider angles, harder shots. No advancement cap.
+    {
+        "spawn": dict(
+            angle=math.radians(40),
+            d_min=600, d_max=2000,
+            h_min=93, h_max=300,
+            ground_frac=0.4,
+            car_y_min=-1000, car_y_max=2500,
+            car_yaw_noise=math.radians(15),
+        ),
+        "reward": dict(
+            approach_w=0.05, first_touch=1.0, hit_direction_w=5.0,
+            goal_base=5.0, shot_speed_w=10.0,
+            second_touch_pen=-3.0, no_touch_pen=-2.0, own_goal_pen=-3.0,
+        ),
+        "advance_rate": 1.01,  # never advances (final stage)
+    },
 ]
-
-# Module-level per-worker episode counter, updated by PowerShotMutator.apply().
-# PowerShotReward reads this to pick the matching reward config.
-_worker_episode_count = 0
-
-
-def _get_stage(episode_count):
-    for threshold, spawn_cfg, reward_cfg in _CURRICULUM:
-        if threshold is None or episode_count < threshold:
-            return spawn_cfg, reward_cfg
-    return _CURRICULUM[-1][1], _CURRICULUM[-1][2]
 
 
 # ---------------------------------------------------------------------------
 # State Mutator
 # ---------------------------------------------------------------------------
 class PowerShotMutator:
-    def __init__(self):
-        self.episode_count = 0
-
     def apply(self, state, shared_info: dict) -> None:
-        global _worker_episode_count
-        self.episode_count += 1
-        _worker_episode_count = self.episode_count
+        stage = _get_stage()
+        spawn = stage["spawn"]
 
-        spawn, _ = _get_stage(self.episode_count)
-
-        # Car spawn
+        # -- Car spawn --
         car_x = random.uniform(-CAR_SPAWN_X_RANGE, CAR_SPAWN_X_RANGE)
-        car_y = random.uniform(CAR_SPAWN_Y_MIN, CAR_SPAWN_Y_MAX)
+        car_y = random.uniform(spawn["car_y_min"], spawn["car_y_max"])
         car_z = 17.0
 
-        yaw_noise = random.uniform(-math.radians(15), math.radians(15))
+        yaw_noise = random.uniform(-spawn["car_yaw_noise"], spawn["car_yaw_noise"])
         car_yaw = math.pi / 2 + yaw_noise  # facing orange goal (+y)
 
         agent_id = list(state.cars.keys())[0]
@@ -147,41 +200,26 @@ class PowerShotMutator:
         car.physics.euler_angles = np.array([0.0, car_yaw, 0.0], dtype=np.float32)
         car.boost_amount = random.uniform(50, 100) / 100.0
 
-        # Ball spawn
+        # -- Ball spawn --
         ball_angle = car_yaw + random.uniform(-spawn["angle"], spawn["angle"])
         ball_dist = random.uniform(spawn["d_min"], spawn["d_max"])
-        ball_x = float(np.clip(car_x + math.cos(ball_angle) * ball_dist, -SIDE_WALL_X + 200, SIDE_WALL_X - 200))
-        ball_y = float(np.clip(car_y + math.sin(ball_angle) * ball_dist, -BACK_WALL_Y + 200, BACK_WALL_Y - 200))
-        ball_z = float(random.uniform(spawn["h_min"], spawn["h_max"]))
+        ball_x = float(np.clip(
+            car_x + math.cos(ball_angle) * ball_dist,
+            -SIDE_WALL_X + 200, SIDE_WALL_X - 200,
+        ))
+        ball_y = float(np.clip(
+            car_y + math.sin(ball_angle) * ball_dist,
+            -BACK_WALL_Y + 200, BACK_WALL_Y - 200,
+        ))
 
-        dx = car_x - ball_x
-        dy = car_y - ball_y
-        horiz_dist = math.sqrt(dx * dx + dy * dy) + 1e-6
-        speed = random.uniform(spawn["s_min"], spawn["s_max"])
-
-        if speed < 5.0:
-            vx, vy, vz = dx / horiz_dist * 5.0, dy / horiz_dist * 5.0, 0.0
-        elif spawn["h_min"] == spawn["h_max"] == 93:
-            # Ground roll: purely horizontal
-            vx = speed * dx / horiz_dist
-            vy = speed * dy / horiz_dist
-            vz = 0.0
+        # Ground or dropped from height based on ground_frac
+        if random.random() < spawn["ground_frac"]:
+            ball_z = 93.0  # resting on ground
         else:
-            # Arcing pass with gravity compensation
-            dz = car_z - ball_z
-            horiz_speed = speed * math.cos(math.atan2(abs(dz), horiz_dist))
-            vx = horiz_speed * dx / horiz_dist
-            vy = horiz_speed * dy / horiz_dist
-            time_of_flight = horiz_dist / (horiz_speed + 1e-6)
-            vz = dz / (time_of_flight + 1e-6) + 0.5 * GRAVITY * time_of_flight
-
-        vel = np.array([vx, vy, vz], dtype=np.float32)
-        mag = float(np.linalg.norm(vel))
-        if mag > BALL_MAX_SPEED:
-            vel = vel * (BALL_MAX_SPEED / mag)
+            ball_z = float(random.uniform(spawn["h_min"], spawn["h_max"]))
 
         state.ball.position = np.array([ball_x, ball_y, ball_z], dtype=np.float32)
-        state.ball.linear_velocity = vel
+        state.ball.linear_velocity = np.zeros(3, dtype=np.float32)  # stationary
         state.ball.angular_velocity = np.zeros(3, dtype=np.float32)
 
         shared_info["goal_pos"] = np.array([0.0, ORANGE_GOAL_Y, 0.0], dtype=np.float32)
@@ -193,23 +231,25 @@ class PowerShotMutator:
 class PowerShotReward:
     def __init__(self):
         self._has_touched: Dict[Any, bool] = {}
-        self._prev_dist: Dict[Any, float] = {}
-        self._post_touch_reward_given: Dict[Any, bool] = {}
+        self._hit_reward_given: Dict[Any, bool] = {}
+        self._episode_scored: Dict[Any, bool] = {}
 
     def reset(self, agents, initial_state, shared_info: dict) -> None:
-        ball_pos = initial_state.ball.position
         for agent in agents:
             self._has_touched[agent] = False
-            self._post_touch_reward_given[agent] = False
-            car_pos = initial_state.cars[agent].physics.position
-            self._prev_dist[agent] = float(np.linalg.norm(car_pos - ball_pos))
+            self._hit_reward_given[agent] = False
+            self._episode_scored[agent] = False
 
     def get_rewards(self, agents, state, is_terminated, is_truncated, shared_info: dict) -> Dict[Any, float]:
-        _, rcfg = _get_stage(_worker_episode_count)
+        rcfg = _get_stage()["reward"]
 
         goal_pos = shared_info.get("goal_pos", np.array([0.0, ORANGE_GOAL_Y, 0.0]))
         ball_pos = state.ball.position
         ball_vel = state.ball.linear_velocity
+
+        goal_dir = goal_pos - ball_pos
+        goal_dist = float(np.linalg.norm(goal_dir)) + 1e-6
+        goal_dir_unit = goal_dir / goal_dist
 
         rewards = {}
         for agent in agents:
@@ -217,40 +257,50 @@ class PowerShotReward:
             car_pos = state.cars[agent].physics.position
             dist_to_ball = float(np.linalg.norm(car_pos - ball_pos))
 
-            # 1. Approach reward — before first touch, reward closing distance to ball
-            if not self._has_touched.get(agent, False):
-                prev = self._prev_dist.get(agent, dist_to_ball)
-                closing = (prev - dist_to_ball) / (BALL_MAX_SPEED / _DPS)
-                r += rcfg["approach_w"] * max(0.0, closing)
-                # Small gradient: nudge toward ball even when not closing fast
-                r += rcfg["approach_w"] * 0.1 * max(0.0, 1.0 - dist_to_ball / 5000.0)
+            touched = self._has_touched.get(agent, False)
 
-            self._prev_dist[agent] = dist_to_ball
+            # 1. Pre-touch: small inverse-distance nudge toward ball
+            if not touched:
+                r += rcfg["approach_w"] * max(0.0, 1.0 - dist_to_ball / 3000.0)
 
             # 2. Touch detection (proximity-based)
-            touched_now = dist_to_ball < 200.0
-            if touched_now and not self._has_touched.get(agent, False):
+            touching_now = dist_to_ball < 200.0
+
+            if touching_now and not touched:
+                # First touch — fire one-time directional hit bonus
                 self._has_touched[agent] = True
+                touched = True
                 r += rcfg["first_touch"]
 
-                # 3. Post-touch ball speed bonus — one-time, fires at moment of first contact.
-                # Rewards hitting the ball hard regardless of whether it scores.
-                if not self._post_touch_reward_given.get(agent, False):
-                    ball_speed = float(np.linalg.norm(ball_vel))
-                    r += rcfg["post_touch_speed_w"] * (ball_speed / BALL_MAX_SPEED)
-                    self._post_touch_reward_given[agent] = True
+                if not self._hit_reward_given.get(agent, False):
+                    # Reward = how hard AND how on-target the hit is, in one shot.
+                    # max(0,...) means sideways/backward gives nothing — no punishment for bad aim,
+                    # but a clean goalward hit earns the full bonus.
+                    ball_speed_toward_goal = float(np.dot(ball_vel, goal_dir_unit))
+                    r += rcfg["hit_direction_w"] * max(0.0, ball_speed_toward_goal / BALL_MAX_SPEED)
+                    self._hit_reward_given[agent] = True
 
-            # 4 & 5. Goal scored / own goal (terminal)
+            elif touching_now and touched and self._hit_reward_given.get(agent, False):
+                # Second (or later) touch — penalise to discourage dribbling/follow-up hits
+                r += rcfg["second_touch_pen"]
+
+            # 3. Goal / own goal (terminal)
             if is_terminated.get(agent, False) and getattr(state, "goal_scored", False):
                 if getattr(state, "scoring_team", -1) == 0:
                     ball_speed = float(np.linalg.norm(state.ball.linear_velocity))
                     r += rcfg["goal_base"] + rcfg["shot_speed_w"] * (ball_speed / BALL_MAX_SPEED)
+                    self._episode_scored[agent] = True
                 else:
                     r += rcfg["own_goal_pen"]
 
-            # 6. No-touch timeout penalty
-            if is_truncated.get(agent, False) and not self._has_touched.get(agent, False):
+            # 4. No-touch penalty
+            episode_done = is_terminated.get(agent, False) or is_truncated.get(agent, False)
+            if episode_done and not self._has_touched.get(agent, False):
                 r += rcfg["no_touch_pen"]
+
+            # 5. Record outcome for stage progression
+            if episode_done:
+                _record_episode_outcome(self._episode_scored.get(agent, False))
 
             rewards[agent] = r
 
@@ -285,10 +335,8 @@ class PowerShotTerminationCondition:
                 done = True
             elif self._has_touched.get(agent, False):
                 self._post_touch_steps[agent] = self._post_touch_steps.get(agent, 0) + 1
-                # End episode 3 seconds after first touch — no time to dribble
                 if self._post_touch_steps[agent] >= _POST_TOUCH_STEPS:
                     done = True
-                # Also end early if ball comes to rest
                 elif ball_speed < 50.0 and ball_pos[2] < 150.0:
                     done = True
             result[agent] = done

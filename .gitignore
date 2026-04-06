@@ -11,5 +11,6 @@ models-*/
 wandb/
 *.log
 rlviser
-artifacts/
+artifacts/*.gif
+artifacts/periodic_p95/
 metrics/
